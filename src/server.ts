@@ -2562,6 +2562,20 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // the outbound grew past 300K: growth read as 0 for 154 consecutive
     // turns and the nudge never fired.
     const anchorStale = usageAnchorCycleStale(session.stats);
+    // A successful fold has already netted its pending credit out of this
+    // usage baseline (#252). The resent history still contains the folded
+    // originals until processTurn below, so #4805's raw-payload size check
+    // cannot invalidate this adjustment and resurrect the pre-fold grade.
+    // Keep the cycle-stale guard: an unreported later send must still size
+    // from its newer local evidence (#4383). Zero is a valid drained credit.
+    if (!anchorStale
+        && session.stats.lastInputTokensSource === "usage"
+        && Number.isFinite(session.stats.compressCreditTokens)
+        && session.stats.compressCreditTokens > 0
+        && Number.isFinite(session.stats.lastInputTokens)
+        && session.stats.lastInputTokens >= 0) {
+        return { tokens: session.stats.lastInputTokens, source: "usage" };
+    }
     // #1492: only usage-grade baselines are authoritative sizing inputs. An
     // estimate-sourced value describes ONE turn's outbound — possibly the FULL
     // raw history on an unfolded fallback turn — and pinning the nudge to it
