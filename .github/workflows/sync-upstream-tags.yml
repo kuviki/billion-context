@@ -1,0 +1,32 @@
+name: Sync upstream tags
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-tags
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'kuviki/billion-context'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch and push upstream tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/ranxianglei/billion-context.git
+          # Tags only: preserve branches and reject changed tags instead of forcing.
+          git fetch --no-tags upstream 'refs/tags/*:refs/tags/*'
+          git push --atomic origin 'refs/tags/*:refs/tags/*'
