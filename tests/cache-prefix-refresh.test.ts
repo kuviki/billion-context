@@ -521,19 +521,32 @@ for (const [protocol, reply, api] of [
     });
 }
 
-test("reply larger than 64 KiB is bounded and never reported as completed", async () => {
-    const s = session();
-    await prime(s);
-    response = { content: [{ type: "text", text: "x".repeat(70 * 1024) }], stop_reason: "end_turn", usage: { input_tokens: 100, cache_read_input_tokens: 80 } };
-    await warm(s);
-    await beforeCachePrefixRefresh(input(s));
-    assert.equal(requests.length, 1);
-    const record = logs.filter(x => x.includes("[cache-prefix-refresh]")).at(-1)!;
-    assert(record);
-    assert.match(record, /retry=0/);
-    assert(!record.includes("api=completed"));
-    assert(!record.includes("hit=80.0%"));
-});
+for (const extraBytes of [0, 1]) {
+    test(`warm reply at 1 MiB + ${extraBytes} byte(s) is ${extraBytes ? "bounded" : "parsed"}`, async () => {
+        const s = session();
+        await prime(s);
+        const reply = {
+            content: [{ type: "text", text: "" }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 20, cache_read_input_tokens: 80 },
+        };
+        const paddingBytes = 1024 * 1024 + extraBytes - Buffer.byteLength(JSON.stringify(reply));
+        // Use multibyte characters so the fixture checks bytes, not JS string length.
+        reply.content[0].text = "界".repeat(Math.floor(paddingBytes / 3)) + "x".repeat(paddingBytes % 3);
+        response = JSON.stringify(reply);
+        assert.equal(Buffer.byteLength(response), 1024 * 1024 + extraBytes);
+        await warm(s, afterBody, { timeoutMs: 5000 });
+        await beforeCachePrefixRefresh(input(s));
+        assert.equal(requests.length, 1);
+        const record = logs.filter(x => x.includes("[cache-prefix-refresh]")).at(-1) ?? "";
+        assert.match(record, /retry=0/);
+        if (extraBytes) {
+            assert.match(record, /failed .*api=unknown .*hit=unknown .*reason=response-byte-limit/);
+        } else {
+            assert.match(record, /success .*api=completed .*hit=80\.0% .*reason=completed/);
+        }
+    });
+}
 
 for (const protocol of ["openai", "anthropic", "responses"] as const) {
     test(`${protocol} HTTP 200 without API completion is explicitly unknown`, async () => {

@@ -8,7 +8,7 @@ import type { Session } from "./session.js";
 import { usageTotals, type WireProtocol } from "./util.js";
 
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
-const MAX_REPLY_BYTES = 64 * 1024;
+const MAX_REPLY_BYTES = 1024 * 1024;
 type Json = Record<string, unknown>;
 type Snapshot = { body: Json; namespace: string; order: number; skipReason?: string };
 type RefreshState = { last?: Snapshot; pending?: Snapshot; active?: Promise<void>; order: number };
