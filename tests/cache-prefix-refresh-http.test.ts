@@ -21,8 +21,8 @@ async function close(server: http.Server): Promise<void> {
     await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
-for (const protocol of ["openai", "anthropic"] as const) {
-    test(`real ${protocol} relay runs provider-enabled prefix refresh before main and isolates usage`, { timeout: 20_000 }, async () => {
+for (const protocol of ["openai", "anthropic"] as const) for (const stream of [false, true]) {
+    test(`real ${protocol} stream=${stream} relay runs provider-enabled prefix refresh before main and isolates usage`, { timeout: 20_000 }, async () => {
         _resetPrefixRefreshForTest();
         _setStoreForTest(new SessionStore({ enabled: false }));
         setRegistryForTest({});
@@ -41,8 +41,21 @@ for (const protocol of ["openai", "anthropic"] as const) {
             const result = protocol === "anthropic"
                 ? { id: `msg_${sent.length}`, type: "message", role: "assistant", content: [{ type: "text", text: "reply" }], stop_reason: "end_turn", model: "plain-test", usage }
                 : { id: `chatcmpl-${sent.length}`, object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "reply" }, finish_reason: "stop" }], model: "plain-test", usage };
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify(result));
+            res.writeHead(200, { "content-type": stream ? "text/event-stream" : "application/json" });
+            if (!stream) res.end(JSON.stringify(result));
+            else if (protocol === "openai") {
+                res.write(`data: ${JSON.stringify({ id: "chat_warm", choices: [{ index: 0, delta: { content: "reply" }, finish_reason: "stop" }] })}\n\n`);
+                res.write(`data: ${JSON.stringify({ choices: [], usage })}\n\n`);
+                res.end("data: [DONE]\n\n");
+            } else {
+                const event = (type: string, data: unknown) => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+                res.write(event("message_start", { type: "message_start", message: { id: "msg_reply", type: "message", role: "assistant", content: [], model: "plain-test", usage } }));
+                res.write(event("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+                res.write(event("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "reply" } }));
+                res.write(event("content_block_stop", { type: "content_block_stop", index: 0 }));
+                res.write(event("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }));
+                res.end(event("message_stop", { type: "message_stop" }));
+            }
         });
         upstream.listen(0, "127.0.0.1");
         await once(upstream, "listening");
@@ -59,14 +72,14 @@ for (const protocol of ["openai", "anthropic"] as const) {
         };
         const proxy = await startServer(opts);
         if (!proxy.listening) await once(proxy, "listening");
-        const sid = `refresh-http-${protocol}`;
+        const sid = `refresh-http-${protocol}-${stream}`;
         const endpoint = protocol === "anthropic" ? "/v1/messages" : "/v1/chat/completions";
         const url = `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/${origin}${endpoint}`;
         const post = async (suffix: string) => {
             const response = await fetch(url, {
                 method: "POST", signal: AbortSignal.timeout(10_000),
                 headers: { "content-type": "application/json", "x-acp-session": sid, "x-api-key": "synthetic-key" },
-                body: JSON.stringify({ model: "plain-test", stream: false, max_tokens: 4000, messages: [{ role: "user", content: "stable first A" }, { role: "assistant", content: suffix }, { role: "user", content: "stable tail" }] }),
+                body: JSON.stringify({ model: "plain-test", stream, ...(protocol === "openai" && stream ? { stream_options: { include_usage: false } } : {}), max_tokens: 4000, messages: [{ role: "user", content: "stable first A" }, { role: "assistant", content: suffix }, { role: "user", content: "stable tail" }] }),
             });
             assert.equal(response.status, 200);
             assert.match(await response.text(), /reply/);
@@ -82,7 +95,8 @@ for (const protocol of ["openai", "anthropic"] as const) {
             const warmLog = logs.find(x => x.includes("[cache-prefix-refresh] success"));
             assert(warmLog);
             assert.match(warmLog, new RegExp(`timeoutMs=${refreshTimeoutMs}\\b`), "resolved provider/model timeout reaches the real relay hook");
-            assert.equal(sent[1].stream, false);
+            assert.equal(sent[1].stream, stream);
+            assert.deepEqual(sent[1].stream_options, sent[2].stream_options, "preserve stream_options exactly without enabling usage");
             assert.match(JSON.stringify(sent[1].messages), /stable first A/);
             assert.doesNotMatch(JSON.stringify(sent[1].messages), /OLD B|NEW C|stable tail/);
             assert.match(JSON.stringify(sent[2].messages), /NEW C/);

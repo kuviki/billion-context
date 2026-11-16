@@ -482,9 +482,9 @@ entries:
     type: boolean
     default: "false"
     group: behavior
-    desc_en: "Send one unchanged legal prefix before the first post-compression request. Anthropic/Chat cap output at 1 token; plain Responses at 16. Independent of idle enabled; model > provider > global. Unsupported shapes skip; failures continue the real request without retry. Extra usage may be billed."
-    desc_zh: "压缩后首次请求前，单独请求一次未变化且协议合法的前缀。Anthropic/Chat 输出上限 1 token，普通 Responses 为 16。独立于空闲保活 enabled；模型 > provider > 全局。不支持的形状跳过，失败不重试并继续正式请求；额外用量可能计费。"
-    desc_ja: "圧縮後最初のリクエスト前に、不変で有効なプレフィックスを一度送信。Anthropic/Chat の出力上限は1トークン、通常の Responses は16。アイドル enabled とは独立。モデル > プロバイダ > 全体。未対応形式はスキップし、失敗しても再試行せず本来のリクエストを続行。追加料金が発生する場合がある。"
+    desc_en: "Send the longest unchanged legal prefix once before the first post-compression request; preserve reasoning effort and stream settings. Anthropic/Chat cap output at 1 token; plain Responses at 16. Independent of idle enabled; model > provider > global. Unsupported shapes skip; failures continue the real request without retry. Extra usage may be billed."
+    desc_zh: "压缩后首次请求前，单独请求一次最长的未变化且协议合法的前缀；保留 reasoning effort 和流式设置。Anthropic/Chat 输出上限 1 token，普通 Responses 为 16。独立于空闲保活 enabled；模型 > provider > 全局。不支持的形状跳过，失败不重试并继续正式请求；额外用量可能计费。"
+    desc_ja: "圧縮後最初のリクエスト前に、不変で有効な最長プレフィックスを一度送信。reasoning effort とストリーム設定を保持。Anthropic/Chat の出力上限は1トークン、通常の Responses は16。アイドル enabled とは独立。モデル > プロバイダ > 全体。未対応形式はスキップし、失敗しても再試行せず本来のリクエストを続行。追加料金が発生する場合がある。"
   - key: cacheKeepalive.refreshTimeoutMs
     type: number
     default: "10000"

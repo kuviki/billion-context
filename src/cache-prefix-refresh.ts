@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { credentialFingerprint } from "./cache-ledger.js";
 import { DEFAULT_CACHE_REFRESH_TIMEOUT_MS, MAX_CACHE_REFRESH_TIMEOUT_MS } from "./config.js";
 import { fetchWithTimeout } from "./fetch-util.js";
-import { currentFetchTransport } from "./fetch-transport.js";
+import { currentFetchTransport, isWsLaneTransport } from "./fetch-transport.js";
 import { log } from "./logger.js";
 import type { Session } from "./session.js";
 import { usageTotals, type WireProtocol } from "./util.js";
@@ -10,10 +10,10 @@ import { usageTotals, type WireProtocol } from "./util.js";
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 const MAX_REPLY_BYTES = 64 * 1024;
 type Json = Record<string, unknown>;
-type Snapshot = { body: Json; namespace: string; order: number };
+type Snapshot = { body: Json; namespace: string; order: number; skipReason?: string };
 type RefreshState = { last?: Snapshot; pending?: Snapshot; active?: Promise<void>; order: number };
 let states = new WeakMap<Session, RefreshState>();
-const ignored = new Set(["messages", "input", "stream", "stream_options", "max_tokens", "max_completion_tokens", "max_output_tokens"]);
+const promptFields = ["model", "system", "instructions", "tools", "functions", "tool_choice", "function_call", "parallel_tool_calls", "response_format", "text", "prompt", "prompt_cache_key", "prompt_cache_retention", "thinking", "reasoning", "reasoning_effort", "enable_thinking", "chat_template_kwargs", "cache_control", "context_management", "user", "safety_identifier"];
 const obj = (v: unknown): v is Json => v !== null && typeof v === "object" && !Array.isArray(v);
 const equal = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 
@@ -28,6 +28,7 @@ export interface PrefixRefreshInput {
     dispatcher?: object;
     signal?: AbortSignal;
     unsupported?: boolean;
+    unsupportedReason?: string;
 }
 
 export function noteCompressionForPrefixRefresh(session: Session): void {
@@ -35,103 +36,186 @@ export function noteCompressionForPrefixRefresh(session: Session): void {
     if (state?.last && !state.pending) state.pending = state.last;
 }
 
-function parseSnapshot(inp: PrefixRefreshInput): Snapshot | undefined {
-    if (inp.unsupported || currentFetchTransport() || typeof inp.body !== "string" || Buffer.byteLength(inp.body) > MAX_SNAPSHOT_BYTES) return;
-    if (inp.protocol !== "anthropic" && inp.protocol !== "openai" && inp.protocol !== "responses") return;
-    const body: unknown = JSON.parse(inp.body);
-    if (!obj(body)) return;
-    if (body.previous_response_id || body.conversation || body.thread_id || body.mcp_servers || body.container || body.background) return;
-    if (body.web_search_options !== undefined || body.plugins !== undefined || body.context_management !== undefined || body.audio !== undefined) return;
-    if (Array.isArray(body.modalities) && body.modalities.some(m => m !== "text")) return;
-    if (obj(body.thinking) && body.thinking.type !== "disabled") return;
-    if (body.reasoning_effort !== undefined && body.reasoning_effort !== "none") return;
-    if (body.reasoning !== undefined && (!obj(body.reasoning) || body.reasoning.effort !== "none")) return;
-    if (body.enable_thinking === true) return;
-    if (inp.url.includes("chatgpt.com/backend-api/")) return;
-    if (Object.entries(inp.headers).some(([k, v]) => /^(idempotency-key|x-idempotency-key)$/i.test(k) || (k.toLowerCase() === "anthropic-beta" && /message-threads/i.test(v)))) return;
-    if (Array.isArray(body.tools) && body.tools.some(t => !obj(t) || (inp.protocol === "anthropic" ? t.type !== undefined && t.type !== "custom" : t.type !== "function"))) return;
-    const stable: Json = {};
-    for (const key of Object.keys(body).sort()) if (!ignored.has(key)) stable[key] = body[key];
-    const providerHeaders = Object.entries(inp.headers).filter(([k]) => /^(anthropic-version|anthropic-beta|openai-organization|openai-project)$/i.test(k)).map(([k, v]) => [k.toLowerCase(), v]).sort();
-    const namespace = createHash("sha256").update(JSON.stringify([inp.url, inp.protocol, credentialFingerprint(inp.headers), providerHeaders, stable])).digest("hex");
-    return { body, namespace, order: 0 };
+function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefined {
+    if (inp.unsupportedReason) return inp.unsupportedReason;
+    if (inp.unsupported) return "unsupported-wire-transform";
+    if (isWsLaneTransport(currentFetchTransport())) return "stateful-websocket-transport";
+    if (body.previous_response_id) return "previous-response-state";
+    if (body.conversation || body.thread_id) return "server-conversation-state";
+    if (body.container) return "server-container-state";
+    if (body.background === true) return "background-response";
+    if (body.mcp_servers != null && (!Array.isArray(body.mcp_servers) || body.mcp_servers.length > 0)) return "server-mcp-tools";
+    if (body.web_search_options !== undefined && body.web_search_options !== null) return "server-web-search";
+    if (body.plugins != null && (!Array.isArray(body.plugins) || body.plugins.length > 0)) return "server-plugins";
+    if (body.context_management != null && (!obj(body.context_management) || Object.keys(body.context_management).some(k => k !== "edits") || (body.context_management.edits !== undefined && (!Array.isArray(body.context_management.edits) || body.context_management.edits.length > 0)))) return "server-context-management";
+    if (body.audio !== undefined || (Array.isArray(body.modalities) && body.modalities.some(m => m !== "text"))) return "non-text-output-cap-unverified";
+    const headers = Object.entries(inp.headers);
+    if (headers.some(([k]) => /^(idempotency-key|x-idempotency-key)$/i.test(k))) return "main-request-idempotency-key";
+    const beta = headers.find(([k]) => k.toLowerCase() === "anthropic-beta")?.[1] ?? "";
+    if (/message-threads/i.test(beta)) return "server-message-threads";
+    if (inp.protocol === "anthropic" && obj(body.thinking) && body.thinking.type === "enabled" && !/interleaved-thinking/i.test(beta)) return "thinking-budget-exceeds-output-cap";
+    const noTools = body.tool_choice === "none" || (obj(body.tool_choice) && body.tool_choice.type === "none");
+    if (body.tools !== undefined && !Array.isArray(body.tools)) return "unknown-tools-shape";
+    if (!noTools && Array.isArray(body.tools) && body.tools.some(t => !obj(t) || (inp.protocol === "anthropic" ? t.type !== undefined && t.type !== "custom" : t.type !== "function" && t.type !== "custom"))) return "server-or-unknown-tools";
+    if (inp.protocol === "responses") {
+        const endpoint = new URL(inp.url);
+        if (endpoint.hostname === "chatgpt.com" && endpoint.pathname.startsWith("/backend-api/")) return "codex-oauth-output-cap-unsupported";
+        const learned = inp.session.metadata?.preflightNoMaxOutputTokens;
+        if (obj(learned) && learned[`${inp.url}\u0000${String(body.model)}`] === true) return "learned-output-cap-unsupported";
+    }
+    return undefined;
 }
 
-function safeEnds(items: unknown[], protocol: WireProtocol): Set<number> {
+function parseSnapshot(inp: PrefixRefreshInput): { snapshot?: Snapshot; reason?: string } {
+    if (Buffer.byteLength(inp.body) > MAX_SNAPSHOT_BYTES) return { reason: "snapshot-byte-limit" };
+    if (inp.protocol !== "anthropic" && inp.protocol !== "openai" && inp.protocol !== "responses") return { reason: "unsupported-protocol" };
+    let body: unknown;
+    try { body = JSON.parse(inp.body.toString()); } catch { return { reason: "non-json-wire-body" }; }
+    if (!obj(body)) return { reason: "non-object-wire-body" };
+    const stable = Object.fromEntries(promptFields.filter(k => body[k] !== undefined).map(k => [k, body[k]]));
+    const providerHeaders = Object.entries(inp.headers).filter(([k]) => /^(anthropic-version|anthropic-beta|openai-organization|openai-project)$/i.test(k)).map(([k, v]) => [k.toLowerCase(), v]).sort();
+    const namespace = createHash("sha256").update(JSON.stringify([inp.url, inp.protocol, credentialFingerprint(inp.headers), providerHeaders, stable])).digest("hex");
+    return { snapshot: { body, namespace, order: 0, skipReason: unsupportedReason(inp, body) } };
+}
+
+function safeEnds(items: unknown[], protocol: WireProtocol, body: Json): Set<number> {
     const ends = new Set<number>();
     const calls = new Set<string>();
+    let reasoningPending = false;
+    const noAnthropicPrefill = (obj(body.thinking) && body.thinking.type !== "disabled") || /claude-(?:opus-4-[67]|sonnet-4-6|mythos-preview)(?:-|$)/i.test(String(body.model));
     for (let i = 0; i < items.length; i++) {
         const item = items[i];
         if (!obj(item)) break;
-        let user = item.role === "user";
         if (protocol === "anthropic") {
             if (item.role !== "user" && item.role !== "assistant") break;
-            const content = item.content;
-            if (typeof content !== "string" && !Array.isArray(content)) break;
+            if (typeof item.content !== "string" && !Array.isArray(item.content)) break;
             let invalid = false;
-            for (const block of Array.isArray(content) ? content : []) {
+            for (const block of Array.isArray(item.content) ? item.content : []) {
                 if (!obj(block)) { invalid = true; break; }
                 if (block.type === "tool_use") {
                     if (typeof block.id !== "string" || calls.has(block.id)) { invalid = true; break; }
                     calls.add(block.id);
                 } else if (block.type === "tool_result") {
                     if (typeof block.tool_use_id !== "string" || !calls.delete(block.tool_use_id)) { invalid = true; break; }
-                } else if (block.type !== "text" && block.type !== "image" && block.type !== "document") {
-                    invalid = true; break;
-                }
+                } else if (!["text", "image", "document", "thinking", "redacted_thinking"].includes(String(block.type))) { invalid = true; break; }
             }
             if (invalid) break;
+            if (item.role === "assistant" && noAnthropicPrefill) continue;
         } else if (protocol === "openai") {
-            if (!["system", "developer", "user", "assistant", "tool"].includes(String(item.role))) break;
-            if (item.reasoning_content || item.reasoning || item.function_call) break;
-            if (Array.isArray(item.tool_calls)) {
-                let invalid = false;
-                for (const call of item.tool_calls) {
-                    if (!obj(call) || typeof call.id !== "string" || calls.has(call.id)) { invalid = true; break; }
-                    calls.add(call.id);
-                }
-                if (invalid) break;
+            if (!["system", "developer", "user", "assistant", "tool", "function"].includes(String(item.role))) break;
+            let invalid = false;
+            for (const call of Array.isArray(item.tool_calls) ? item.tool_calls : []) {
+                if (!obj(call) || typeof call.id !== "string" || calls.has(call.id)) { invalid = true; break; }
+                calls.add(call.id);
             }
-            if (item.role === "tool") {
-                if (typeof item.tool_call_id !== "string" || !calls.delete(item.tool_call_id)) break;
-                user = true;
+            if (invalid) break;
+            if (obj(item.function_call)) {
+                if (typeof item.function_call.name !== "string" || calls.has(`legacy:${item.function_call.name}`)) break;
+                calls.add(`legacy:${item.function_call.name}`);
             }
+            if (item.role === "tool" && (typeof item.tool_call_id !== "string" || !calls.delete(item.tool_call_id))) break;
+            if (item.role === "function" && (typeof item.name !== "string" || !calls.delete(`legacy:${item.name}`))) break;
         } else {
-            if (item.type === "function_call") {
+            if (item.status === "in_progress") break;
+            if (item.type === "function_call" || item.type === "custom_tool_call") {
                 if (typeof item.call_id !== "string" || calls.has(item.call_id)) break;
                 calls.add(item.call_id);
-            } else if (item.type === "function_call_output") {
+                reasoningPending = false;
+            } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
                 if (typeof item.call_id !== "string" || !calls.delete(item.call_id)) break;
-                user = true;
-            } else if (item.type !== undefined && item.type !== "message") break;
-            else if (!["user", "assistant", "system", "developer"].includes(String(item.role))) break;
+            } else if (item.type === "reasoning") {
+                reasoningPending = true;
+            } else if (item.type === undefined || item.type === "message") {
+                if (!["user", "assistant", "system", "developer"].includes(String(item.role))) break;
+                if (item.role === "assistant") reasoningPending = false;
+            } else break;
         }
-        if (user && calls.size === 0) ends.add(i + 1);
+        if (calls.size === 0 && !reasoningPending) ends.add(i + 1);
     }
     return ends;
 }
 
-export function buildPrefixRefreshBody(previous: Json, current: Json, protocol: WireProtocol): { body?: string; unchanged: boolean } {
+export function buildPrefixRefreshBody(previous: Json, current: Json, protocol: WireProtocol): { body?: string; unchanged: boolean; reason?: string } {
     const key = protocol === "responses" ? "input" : "messages";
     const oldItems = previous[key];
     const items = current[key];
-    if (!Array.isArray(oldItems) || !Array.isArray(items)) return { unchanged: false };
+    if (!Array.isArray(oldItems) || !Array.isArray(items)) return { unchanged: false, reason: "non-array-history" };
     let count = 0;
     while (count < Math.min(oldItems.length, items.length) && equal(oldItems[count], items[count])) count++;
     if (count === oldItems.length) return { unchanged: true };
-    const ends = safeEnds(items.slice(0, count), protocol);
+    const ends = safeEnds(items.slice(0, count), protocol, current);
     while (count > 0 && !ends.has(count)) count--;
-    if (count === 0) return { unchanged: false };
-    const warm: Json = { ...current, [key]: items.slice(0, count), stream: false };
-    delete warm.stream_options;
+    if (count === 0) return { unchanged: false, reason: protocol === "responses" && current.instructions ? "static-only-responses-unverified" : "no-legal-common-prefix" };
+    const warm: Json = { ...current, [key]: items.slice(0, count) };
     delete warm.max_tokens;
     delete warm.max_completion_tokens;
     delete warm.max_output_tokens;
-    if (protocol === "openai") { warm.n = 1; delete warm.best_of; if (warm.store === true) warm.store = false; }
+    if (protocol === "openai") {
+        if (warm.n !== undefined && warm.n !== 1) warm.n = 1;
+        if (warm.best_of !== undefined && warm.best_of !== 1) warm.best_of = 1;
+        if (warm.store === true) warm.store = false;
+    }
+    const reasoningChat = current.reasoning_effort !== undefined || current.reasoning !== undefined || current.enable_thinking === true || /(?:^|\/)(?:o[134](?:-|$)|gpt-5(?:[.-]|$))/i.test(String(current.model));
     if (protocol === "responses") { warm.max_output_tokens = 16; warm.store = false; }
-    else if (protocol === "openai" && current.max_completion_tokens !== undefined) warm.max_completion_tokens = 1;
+    else if (protocol === "openai" && (current.max_completion_tokens !== undefined || reasoningChat)) warm.max_completion_tokens = 1;
     else warm.max_tokens = 1;
     return { body: JSON.stringify(warm), unchanged: false };
+}
+
+type ApiResult = { api: string; reason: string; usage?: Json };
+function responseResult(text: string, stream: boolean, protocol: WireProtocol): ApiResult {
+    let usage: Json | undefined;
+    let api = "unknown";
+    let reason = "api-status-unavailable";
+    let terminal = false;
+    let malformed = false;
+    const stop = (v: unknown) => {
+        if (v === "length" || v === "max_tokens" || v === "max_output_tokens") { api = "output-limit"; reason = "api-output-limit"; }
+        else if (v === "content_filter" || v === "model_context_window_exceeded") { api = "incomplete"; reason = "api-incomplete"; }
+        else if (["stop", "end_turn", "stop_sequence", "tool_calls", "function_call", "tool_use"].includes(String(v))) { api = "completed"; reason = "completed"; }
+    };
+    const accept = (value: unknown, event = "") => {
+        if (!obj(value)) { malformed = true; return; }
+        const type = typeof value.type === "string" ? value.type : event;
+        if (obj(value.usage)) usage = { ...usage, ...value.usage };
+        if (obj(value.response) && obj(value.response.usage)) usage = { ...usage, ...value.response.usage };
+        if (api === "failed") return;
+        if (value.error || type === "error" || type === "response.failed" || value.status === "failed") { api = "failed"; reason = "api-error"; terminal = true; return; }
+        if (protocol === "anthropic") {
+            if (obj(value.message) && obj(value.message.usage)) usage = { ...usage, ...value.message.usage };
+            stop(value.stop_reason);
+            if (obj(value.delta)) stop(value.delta.stop_reason);
+            if (type === "message_stop") terminal = true;
+        } else if (protocol === "openai") {
+            for (const choice of Array.isArray(value.choices) ? value.choices : []) {
+                if (obj(choice) && typeof choice.finish_reason === "string") stop(choice.finish_reason);
+            }
+        } else {
+            const result = obj(value.response) ? value.response : value;
+            if (obj(result.usage)) usage = { ...usage, ...result.usage };
+            if (type === "response.completed" || result.status === "completed") { api = "completed"; reason = "completed"; terminal = true; }
+            if (type === "response.incomplete" || result.status === "incomplete") {
+                api = "incomplete"; reason = "api-incomplete"; terminal = true;
+                if (obj(result.incomplete_details) && result.incomplete_details.reason === "max_output_tokens") stop("max_output_tokens");
+            }
+            if (result.error || result.status === "failed") { api = "failed"; reason = "api-error"; terminal = true; }
+        }
+    };
+    if (stream) {
+        for (const block of text.split(/\r?\n\r?\n/)) {
+            const lines = block.split(/\r?\n/);
+            const data = lines.filter(x => x.startsWith("data:")).map(x => x.slice(5).trimStart()).join("\n");
+            if (!data) continue;
+            if (data === "[DONE]") { if (protocol === "openai") terminal = true; continue; }
+            try { accept(JSON.parse(data), lines.find(x => x.startsWith("event:"))?.slice(6).trim()); }
+            catch { malformed = true; }
+        }
+        if (!terminal && api !== "failed") { api = "stream-truncated"; reason = "missing-stream-terminal"; }
+    } else {
+        try { accept(JSON.parse(text)); } catch { malformed = true; }
+    }
+    if (malformed && api !== "failed") { api = "unknown"; reason = "malformed-response"; }
+    return { api, reason, usage };
 }
 
 async function sendRefresh(inp: PrefixRefreshInput, body: string): Promise<void> {
@@ -142,42 +226,61 @@ async function sendRefresh(inp: PrefixRefreshInput, body: string): Promise<void>
     const signal = inp.signal ? AbortSignal.any([inp.signal, controller.signal]) : controller.signal;
     const deadline = setTimeout(() => controller.abort(), timeoutMs);
     let cleanup: (() => void) | undefined;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let abort: (() => void) | undefined;
     const started = Date.now();
     let status: number | undefined;
+    let replyLimit = false;
     try {
-        const result = await fetchWithTimeout(inp.url, { method: "POST", headers, body, dispatcher: inp.dispatcher, redirect: "error" }, timeoutMs, signal);
-        cleanup = result.clearTimer;
-        status = result.response.status;
-        const reader = result.response.body?.getReader();
-        let bytes = 0;
-        const chunks: Buffer[] = [];
-        if (reader) {
-            try {
-                while (true) {
-                    const chunk = await reader.read();
-                    if (chunk.done) break;
-                    bytes += chunk.value.byteLength;
-                    if (bytes > MAX_REPLY_BYTES) { await reader.cancel(); break; }
-                    chunks.push(Buffer.from(chunk.value));
-                }
-            } finally { reader.releaseLock(); }
-        }
-        let metrics = "cached=unknown total=unknown hit=unknown";
-        try {
-            const reply: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-            if (obj(reply) && obj(reply.usage) && inp.protocol) {
-                const totals = usageTotals(inp.protocol, reply.usage);
-                const hit = totals.total !== undefined && totals.total > 0 && totals.cached !== undefined ? `${(100 * totals.cached / totals.total).toFixed(1)}%` : "unknown";
-                metrics = `cached=${totals.cached ?? "unknown"} total=${totals.total ?? "unknown"} hit=${hit} creation=${totals.creation ?? "unknown"}`;
+        const aborted = new Promise<never>((_resolve, reject) => {
+            abort = () => { reject(new Error("refresh aborted")); void reader?.cancel().catch(() => undefined); };
+            if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true });
+        });
+        const work = async () => {
+            const result = await fetchWithTimeout(inp.url, { method: "POST", headers, body, dispatcher: inp.dispatcher, redirect: "error" }, timeoutMs, signal);
+            cleanup = result.clearTimer;
+            if (signal.aborted) { cleanup(); void result.response.body?.cancel().catch(() => undefined); throw new Error("refresh aborted"); }
+            status = result.response.status;
+            reader = result.response.body?.getReader();
+            let bytes = 0;
+            const chunks: Buffer[] = [];
+            if (reader) {
+                try {
+                    while (!signal.aborted) {
+                        const chunk = await reader.read();
+                        if (chunk.done) break;
+                        bytes += chunk.value.byteLength;
+                        if (bytes > MAX_REPLY_BYTES) { replyLimit = true; void reader.cancel().catch(() => undefined); break; }
+                        chunks.push(Buffer.from(chunk.value));
+                    }
+                } finally { try { reader.releaseLock(); } catch { /* Pending cancellation is best-effort. */ } }
             }
-        } catch { /* Response content is discarded; missing usage stays unknown. */ }
-        log("info", `[${inp.session.id}] [cache-prefix-refresh] ${result.response.ok ? "success" : "failed"} status=${status} durationMs=${Date.now() - started} timeoutMs=${timeoutMs} ${metrics} reason=${result.response.ok ? "completed" : "http-error"} retry=0`);
+            const resultText = Buffer.concat(chunks).toString("utf8");
+            const stream = /text\/event-stream/i.test(result.response.headers.get("content-type") ?? "") || /^\s*(event:|data:)/.test(resultText);
+            const parsed = replyLimit ? { api: "unknown", reason: "response-byte-limit" } : responseResult(resultText, stream, inp.protocol!);
+            return { ok: result.response.ok, ...parsed };
+        };
+        const result = await Promise.race([work(), aborted]);
+        let metrics = "cached=unknown total=unknown hit=unknown";
+        if (result.usage && inp.protocol) {
+            const totals = usageTotals(inp.protocol, result.usage);
+            const hit = totals.total !== undefined && totals.total > 0 && totals.cached !== undefined ? `${(100 * totals.cached / totals.total).toFixed(1)}%` : "unknown";
+            metrics = `cached=${totals.cached ?? "unknown"} total=${totals.total ?? "unknown"} hit=${hit} creation=${totals.creation ?? "unknown"}`;
+        }
+        const failed = !result.ok || result.api === "failed" || result.api === "incomplete" || result.api === "stream-truncated" || result.reason === "malformed-response" || replyLimit;
+        const outcome = failed ? "failed" : result.api === "unknown" ? "unknown" : "success";
+        log("info", `[${inp.session.id}] [cache-prefix-refresh] ${outcome} status=${status} durationMs=${Date.now() - started} timeoutMs=${timeoutMs} http=${result.ok ? "success" : "failed"} api=${result.api} ${metrics} cacheScope=warm mainHit=unobserved reason=${result.ok ? result.reason : "http-error"} retry=0`);
     } catch {
-        log("info", `[${inp.session.id}] [cache-prefix-refresh] failed status=${status ?? "unknown"} durationMs=${Date.now() - started} timeoutMs=${timeoutMs} cached=unknown total=unknown hit=unknown reason=${controller.signal.aborted ? "timeout" : inp.signal?.aborted ? "aborted" : "network-or-body-error"} retry=0; continuing main request`);
+        log("info", `[${inp.session.id}] [cache-prefix-refresh] failed status=${status ?? "unknown"} durationMs=${Date.now() - started} timeoutMs=${timeoutMs} http=${status === undefined ? "not-completed" : status < 300 ? "success" : "failed"} api=unknown cached=unknown total=unknown hit=unknown cacheScope=warm mainHit=unobserved reason=${controller.signal.aborted ? "timeout" : inp.signal?.aborted ? "aborted" : "network-or-body-error"} retry=0; continuing main request`);
     } finally {
         clearTimeout(deadline);
+        if (abort) signal.removeEventListener("abort", abort);
         cleanup?.();
     }
+}
+
+function logSkip(inp: PrefixRefreshInput, reason: string): void {
+    log("info", `[${inp.session.id}] [cache-prefix-refresh] skipped status=none durationMs=0 http=not-sent api=not-sent cached=unknown total=unknown hit=unknown cacheScope=warm mainHit=unobserved reason=${reason} retry=0`);
 }
 
 /** Returns a receipt to call only after the MAIN request is accepted. */
@@ -185,9 +288,10 @@ export async function beforeCachePrefixRefresh(inp: PrefixRefreshInput): Promise
     const noop = () => undefined;
     if (!inp.enabled) { states.delete(inp.session); return noop; }
     try {
-        const snapshot = parseSnapshot(inp);
+        const parsed = parseSnapshot(inp);
+        const snapshot = parsed.snapshot;
         if (!snapshot) {
-            if (states.get(inp.session)?.pending) log("info", `[${inp.session.id}] [cache-prefix-refresh] skipped status=none durationMs=0 cached=unknown total=unknown hit=unknown reason=unsupported-request retry=0`);
+            if (states.get(inp.session)?.pending) logSkip(inp, parsed.reason ?? "unsupported-request");
             states.delete(inp.session); return noop;
         }
         const state = states.get(inp.session) ?? { order: 0 };
@@ -196,14 +300,15 @@ export async function beforeCachePrefixRefresh(inp: PrefixRefreshInput): Promise
         if (state.active) await state.active;
         const pending = state.pending;
         if (pending) {
-            const plan = pending.namespace === snapshot.namespace ? buildPrefixRefreshBody(pending.body, snapshot.body, inp.protocol!) : { unchanged: false };
+            const plan = pending.namespace === snapshot.namespace ? buildPrefixRefreshBody(pending.body, snapshot.body, inp.protocol!) : { unchanged: false, reason: "prompt-or-route-identity-changed" };
             if (!plan.unchanged) {
                 delete state.pending;
-                if (plan.body && !inp.signal?.aborted) {
+                const reason = snapshot.skipReason ?? pending.skipReason ?? plan.reason;
+                if (plan.body && !reason && !inp.signal?.aborted) {
                     const active = sendRefresh(inp, plan.body);
                     state.active = active;
                     try { await active; } finally { if (state.active === active) delete state.active; }
-                } else log("info", `[${inp.session.id}] [cache-prefix-refresh] skipped status=none durationMs=0 cached=unknown total=unknown hit=unknown reason=no-safe-prefix-or-namespace-changed retry=0`);
+                } else logSkip(inp, inp.signal?.aborted ? "client-aborted" : reason ?? "no-legal-common-prefix");
             }
         }
         return () => {
@@ -211,7 +316,7 @@ export async function beforeCachePrefixRefresh(inp: PrefixRefreshInput): Promise
         };
     } catch {
         states.delete(inp.session);
-        log("info", `[${inp.session.id}] [cache-prefix-refresh] skipped status=none durationMs=0 cached=unknown total=unknown hit=unknown reason=unsupported-request retry=0`);
+        logSkip(inp, "invalid-request-shape");
         return noop;
     }
 }

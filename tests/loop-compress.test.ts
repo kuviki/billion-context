@@ -737,8 +737,8 @@ test("prefix refresh: real compress commit warms unchanged prefix before loop re
     globalThis.fetch = (async (_url, options) => {
         const outgoing = JSON.parse(String(options?.body)) as Record<string, unknown>;
         sent.push(outgoing);
-        return outgoing.stream === false
-            ? new Response(JSON.stringify({ usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 100 } } }), { status: 200 })
+        return outgoing.max_output_tokens === 16
+            ? new Response(sse("response.completed", { type: "response.completed", response: { status: "completed", usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 100 } } } }), { status: 200, headers: { "content-type": "text/event-stream" } })
             : new Response(REFETCH_DONE, { status: 200, headers: { "content-type": "text/event-stream" } });
     }) as typeof fetch;
     setLogCapture((_level, message) => refreshLogs.push(message));
@@ -747,7 +747,7 @@ test("prefix refresh: real compress commit warms unchanged prefix before loop re
         assert(ctx.session.state.blocks.length > 0, "real compression committed");
         assert.equal(sent.length, 2, "one warm then one normal continuation");
         assert(refreshLogs.some(x => x.includes("[cache-prefix-refresh] success") && /timeoutMs=650\b/.test(x)), "request-options timeout reaches the real loop hook");
-        assert.equal(sent[0].stream, false);
+        assert.equal(sent[0].stream, true);
         assert.equal(sent[0].max_output_tokens, 16);
         assert.match(JSON.stringify(sent[0]), /UNCHANGED-PREFIX/);
         assert.doesNotMatch(JSON.stringify(sent[0]), /OLD-COMPRESSIBLE-B|FOLDED-C/);

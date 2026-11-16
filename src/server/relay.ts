@@ -1270,13 +1270,16 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     }
     const refreshAfterCompress = resolveCacheRefreshAfterCompress(opts.routes, upstreamUrl, throttleModel);
     const refreshTimeoutMs = resolveCacheRefreshTimeoutMs(opts.routes, upstreamUrl, throttleModel);
+    const prefixRefreshUnsupportedReason = resignCtx !== undefined ? "request-signature-required"
+        : v1Active ? "enveloped-v1-wire" : prepared?.threadsLane === true ? "server-threads-lane"
+            : prepared?.commandcode !== undefined ? "enveloped-commandcode-wire" : undefined;
     const prefixSnapshotBody = wireBody;
     const acceptPrefixSnapshot = mainSend && prepared
         ? await beforeCachePrefixRefresh({
             session: prepared.session, enabled: refreshAfterCompress,
             timeoutMs: refreshTimeoutMs,
             protocol: prepared.protocol, body: wireBody, url: upstreamUrl, headers, dispatcher,
-            signal: clientAbort.signal, unsupported: resignCtx !== undefined || v1Active || prepared.threadsLane === true || prepared.commandcode !== undefined,
+            signal: clientAbort.signal, unsupportedReason: prefixRefreshUnsupportedReason,
         })
         : () => undefined;
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
@@ -2786,7 +2789,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
                 // single adoption point or parseStream sees no candidates.
-                { url: upstreamUrl, headers: reqHeaders, model: throttleModel, refreshAfterCompress, refreshTimeoutMs, prefixRefreshUnsupported: resignCtx !== undefined || v1Active || prepared.threadsLane === true || prepared.commandcode !== undefined, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", reqHeaders), responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
+                { url: upstreamUrl, headers: reqHeaders, model: throttleModel, refreshAfterCompress, refreshTimeoutMs, prefixRefreshUnsupportedReason, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", reqHeaders), responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
