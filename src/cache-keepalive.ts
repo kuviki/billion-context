@@ -19,7 +19,7 @@
 // provider adapter interface (Gemini's official cache-refresh API), restart
 // persistence.
 
-import { findRoute, loadConfigFile, resolveModelEntryOnRoute, type CacheKeepaliveSettings, type ProviderRoutes } from "./config.js";
+import { DEFAULT_CACHE_REFRESH_TIMEOUT_MS, findRoute, loadConfigFile, parseCacheKeepaliveSettings, resolveModelEntryOnRoute, type CacheKeepaliveSettings, type ProviderRoutes } from "./config.js";
 import { credentialFingerprint } from "./cache-ledger.js";
 import { log as loggerLog } from "./logger.js";
 import { peekSession } from "./session.js";
@@ -94,6 +94,19 @@ export function resolveCacheRefreshAfterCompress(routes: ProviderRoutes | undefi
     const providerValue = route?.cacheKeepalive?.refreshAfterCompress;
     const globalValue = loadConfigFile().cacheKeepalive?.refreshAfterCompress;
     return (modelValue ?? providerValue ?? globalValue) === true;
+}
+
+export function resolveCacheRefreshTimeoutMs(routes: ProviderRoutes | undefined, upstreamUrl: string | undefined, model?: string): number {
+    const route = routes ? findRoute(routes, upstreamUrl) : undefined;
+    const values = [
+        resolveModelEntryOnRoute(route, model).entry?.cacheKeepalive?.refreshTimeoutMs,
+        route?.cacheKeepalive?.refreshTimeoutMs,
+        loadConfigFile().cacheKeepalive?.refreshTimeoutMs,
+    ];
+    for (const value of values) {
+        if (value !== undefined) return parseCacheKeepaliveSettings({ refreshTimeoutMs: value })!.refreshTimeoutMs!;
+    }
+    return DEFAULT_CACHE_REFRESH_TIMEOUT_MS;
 }
 
 export function resolveCacheKeepalive(routes: ProviderRoutes | undefined, upstreamUrl: string | undefined, model?: string): ResolvedKeepalive {

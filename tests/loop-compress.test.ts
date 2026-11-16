@@ -704,6 +704,8 @@ test("loop #422c: refreshFolded throws → re-request keeps the pre-compress vie
 // final adapter build and before sending the compressed continuation.
 test("prefix refresh: real compress commit warms unchanged prefix before loop re-request", async () => {
     const { beforeCachePrefixRefresh, _resetPrefixRefreshForTest } = await import("../src/cache-prefix-refresh.ts");
+    const { setLogCapture } = await import("../src/logger.ts");
+    const refreshLogs: string[] = [];
     _resetPrefixRefreshForTest();
     const ctx = {
         ...withRefs(makeCtx([
@@ -739,10 +741,12 @@ test("prefix refresh: real compress commit warms unchanged prefix before loop re
             ? new Response(JSON.stringify({ usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 100 } } }), { status: 200 })
             : new Response(REFETCH_DONE, { status: 200, headers: { "content-type": "text/event-stream" } });
     }) as typeof fetch;
+    setLogCapture((_level, message) => refreshLogs.push(message));
     try {
-        for await (const _chunk of runCompressLoop(new Response(initial).body!, ctx, request, { url: "http://mock", headers: {}, refreshAfterCompress: true }, adapter, SYS_PROMPT)) { /* drain */ }
+        for await (const _chunk of runCompressLoop(new Response(initial).body!, ctx, request, { url: "http://mock", headers: {}, refreshAfterCompress: true, refreshTimeoutMs: 650 }, adapter, SYS_PROMPT)) { /* drain */ }
         assert(ctx.session.state.blocks.length > 0, "real compression committed");
         assert.equal(sent.length, 2, "one warm then one normal continuation");
+        assert(refreshLogs.some(x => x.includes("[cache-prefix-refresh] success") && /timeoutMs=650\b/.test(x)), "request-options timeout reaches the real loop hook");
         assert.equal(sent[0].stream, false);
         assert.equal(sent[0].max_output_tokens, 16);
         assert.match(JSON.stringify(sent[0]), /UNCHANGED-PREFIX/);
@@ -751,6 +755,7 @@ test("prefix refresh: real compress commit warms unchanged prefix before loop re
         assert.match(JSON.stringify(sent[1]), /FOLDED-C/);
     } finally {
         globalThis.fetch = originalFetch;
+        setLogCapture(null);
         _resetPrefixRefreshForTest();
     }
 });

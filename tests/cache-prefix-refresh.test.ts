@@ -42,7 +42,7 @@ before(async () => {
     url = `http://127.0.0.1:${address.port}/v1/messages`;
 });
 beforeEach(() => {
-    _resetPrefixRefreshForTest(300);
+    _resetPrefixRefreshForTest();
     requests.length = 0;
     logs.length = 0;
     mode = "ok";
@@ -58,7 +58,7 @@ after(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 function input(s: Session, value: Json = afterBody, overrides: Partial<PrefixRefreshInput> = {}): PrefixRefreshInput {
-    return { session: s, enabled: true, protocol: "anthropic", body: JSON.stringify(value), url, headers: { "content-type": "application/json", "x-api-key": "secret-test-value", "anthropic-version": "2023-06-01" }, ...overrides };
+    return { session: s, enabled: true, timeoutMs: 300, protocol: "anthropic", body: JSON.stringify(value), url, headers: { "content-type": "application/json", "x-api-key": "secret-test-value", "anthropic-version": "2023-06-01" }, ...overrides };
 }
 async function prime(s: Session, value: Json = beforeBody, overrides: Partial<PrefixRefreshInput> = {}): Promise<void> {
     const accepted = await beforeCachePrefixRefresh(input(s, value, overrides));
@@ -90,7 +90,10 @@ test("A+B -> commit -> A+C sends only A once before the caller's main request", 
     assert.equal(requests.length, 2);
     const record = logs.find(x => x.includes("[cache-prefix-refresh] success"));
     assert(record);
-    assert.match(record, /status=200 durationMs=\d+ cached=80 total=100 hit=80\.0% creation=10/);
+    assert.match(record, /status=200\b/);
+    assert.match(record, /durationMs=\d+/);
+    assert.match(record, /cached=80 total=100 hit=80\.0% creation=10/);
+    assert.match(record, /timeoutMs=300\b/);
     assert.match(record, /retry=0/);
     assert(!record.includes("secret-test-value"));
     assert(!record.includes("stable A"));
@@ -135,7 +138,10 @@ for (const failureStatus of [400, 429, 500, 503]) {
         assert.equal(requests.length, 1);
         const line = logs.find(x => x.includes("[cache-prefix-refresh] failed"));
         assert(line);
-        assert.match(line, new RegExp(`status=${failureStatus} durationMs=\\d+ cached=unknown total=unknown hit=unknown`));
+        assert.match(line, new RegExp(`status=${failureStatus}\\b`));
+        assert.match(line, /durationMs=\d+/);
+        assert.match(line, /cached=unknown total=unknown hit=unknown/);
+        assert.match(line, /timeoutMs=300\b/);
         assert.match(line, /reason=http-error retry=0/);
         assert(!line.includes("secret-test-value"));
     });
@@ -146,11 +152,17 @@ for (const failureMode of ["timeout", "disconnect"] as const) {
         await prime(s);
         mode = failureMode;
         const started = Date.now();
-        await warm(s);
-        assert(Date.now() - started < 3000);
+        await warm(s, afterBody, { timeoutMs: 125 });
+        assert(Date.now() - started < 1000, "125ms override must bound the warm instead of using the old 2s or default 10s timeout");
         await beforeCachePrefixRefresh(input(s));
         assert.equal(requests.length, 1);
-        assert(logs.some(x => x.includes("[cache-prefix-refresh] failed") && x.includes("retry=0") && x.includes("hit=unknown")));
+        assert(logs.some(x => x.includes("[cache-prefix-refresh] failed") && x.includes("retry=0") && x.includes("hit=unknown") && x.includes("timeoutMs=125")));
+        if (failureMode === "timeout") assert(logs.some(x => x.includes("reason=timeout")));
+        mode = "ok";
+        const main = await fetch(url, { method: "POST", body: JSON.stringify(afterBody) });
+        assert.equal(main.status, 200);
+        await main.text();
+        assert.equal(requests.length, 2, "one failed warm followed by the successful main, never a warm retry");
         server.closeAllConnections();
     });
 }
@@ -294,3 +306,18 @@ test("concurrent post-fold callers share the single warm attempt", async () => {
     for (const receipt of accepted) receipt();
     assert.equal(requests.length, 1);
 });
+
+for (const timeoutMs of [undefined, 120_000]) {
+    test(`refresh timeout ${timeoutMs ?? "default 10000"} is a ceiling, not a fixed delay`, { timeout: 3000 }, async () => {
+        const s = session();
+        await prime(s);
+        const started = Date.now();
+        await warm(s, afterBody, { timeoutMs });
+        assert(Date.now() - started < 2000, "successful warm returns immediately, without sleeping until its deadline");
+        assert.equal(requests.length, 1);
+        const record = logs.find(x => x.includes("[cache-prefix-refresh] success"));
+        assert(record);
+        assert.match(record, new RegExp(`timeoutMs=${timeoutMs ?? 10000}\\b`));
+        assert.match(record, /retry=0/);
+    });
+}

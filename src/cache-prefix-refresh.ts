@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { credentialFingerprint } from "./cache-ledger.js";
+import { DEFAULT_CACHE_REFRESH_TIMEOUT_MS, MAX_CACHE_REFRESH_TIMEOUT_MS } from "./config.js";
 import { fetchWithTimeout } from "./fetch-util.js";
 import { currentFetchTransport } from "./fetch-transport.js";
 import { log } from "./logger.js";
@@ -7,13 +8,11 @@ import type { Session } from "./session.js";
 import { usageTotals, type WireProtocol } from "./util.js";
 
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
-const REFRESH_TIMEOUT_MS = 2_000;
 const MAX_REPLY_BYTES = 64 * 1024;
 type Json = Record<string, unknown>;
 type Snapshot = { body: Json; namespace: string; order: number };
 type RefreshState = { last?: Snapshot; pending?: Snapshot; active?: Promise<void>; order: number };
 let states = new WeakMap<Session, RefreshState>();
-let timeoutMs = REFRESH_TIMEOUT_MS;
 const ignored = new Set(["messages", "input", "stream", "stream_options", "max_tokens", "max_completion_tokens", "max_output_tokens"]);
 const obj = (v: unknown): v is Json => v !== null && typeof v === "object" && !Array.isArray(v);
 const equal = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
@@ -21,6 +20,7 @@ const equal = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.st
 export interface PrefixRefreshInput {
     session: Session;
     enabled: boolean;
+    timeoutMs?: number;
     protocol: WireProtocol | undefined;
     body: string | Buffer;
     url: string;
@@ -135,6 +135,8 @@ export function buildPrefixRefreshBody(previous: Json, current: Json, protocol: 
 }
 
 async function sendRefresh(inp: PrefixRefreshInput, body: string): Promise<void> {
+    const timeoutMs = Number.isSafeInteger(inp.timeoutMs) && inp.timeoutMs! > 0 && inp.timeoutMs! <= MAX_CACHE_REFRESH_TIMEOUT_MS
+        ? inp.timeoutMs! : DEFAULT_CACHE_REFRESH_TIMEOUT_MS;
     const headers = Object.fromEntries(Object.entries(inp.headers).filter(([k]) => !/^(content-length|transfer-encoding|connection)$/i.test(k)));
     const controller = new AbortController();
     const signal = inp.signal ? AbortSignal.any([inp.signal, controller.signal]) : controller.signal;
@@ -169,9 +171,9 @@ async function sendRefresh(inp: PrefixRefreshInput, body: string): Promise<void>
                 metrics = `cached=${totals.cached ?? "unknown"} total=${totals.total ?? "unknown"} hit=${hit} creation=${totals.creation ?? "unknown"}`;
             }
         } catch { /* Response content is discarded; missing usage stays unknown. */ }
-        log("info", `[${inp.session.id}] [cache-prefix-refresh] ${result.response.ok ? "success" : "failed"} status=${status} durationMs=${Date.now() - started} ${metrics} reason=${result.response.ok ? "completed" : "http-error"} retry=0`);
+        log("info", `[${inp.session.id}] [cache-prefix-refresh] ${result.response.ok ? "success" : "failed"} status=${status} durationMs=${Date.now() - started} timeoutMs=${timeoutMs} ${metrics} reason=${result.response.ok ? "completed" : "http-error"} retry=0`);
     } catch {
-        log("info", `[${inp.session.id}] [cache-prefix-refresh] failed status=${status ?? "unknown"} durationMs=${Date.now() - started} cached=unknown total=unknown hit=unknown reason=${controller.signal.aborted ? "timeout" : inp.signal?.aborted ? "aborted" : "network-or-body-error"} retry=0; continuing main request`);
+        log("info", `[${inp.session.id}] [cache-prefix-refresh] failed status=${status ?? "unknown"} durationMs=${Date.now() - started} timeoutMs=${timeoutMs} cached=unknown total=unknown hit=unknown reason=${controller.signal.aborted ? "timeout" : inp.signal?.aborted ? "aborted" : "network-or-body-error"} retry=0; continuing main request`);
     } finally {
         clearTimeout(deadline);
         cleanup?.();
@@ -214,7 +216,6 @@ export async function beforeCachePrefixRefresh(inp: PrefixRefreshInput): Promise
     }
 }
 
-export function _resetPrefixRefreshForTest(ms = REFRESH_TIMEOUT_MS): void {
+export function _resetPrefixRefreshForTest(): void {
     states = new WeakMap();
-    timeoutMs = ms;
 }

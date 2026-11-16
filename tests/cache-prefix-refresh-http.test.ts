@@ -10,6 +10,7 @@ import { getCacheLedger } from "../src/cache-ledger.ts";
 import { noteCompressionForPrefixRefresh, _resetPrefixRefreshForTest } from "../src/cache-prefix-refresh.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { setLogCapture } from "../src/logger.ts";
 import { _resetFetchUtilForTest } from "../src/fetch-util.ts";
 
 process.env.BILI_STORAGE_UNIFIED = "legacy";
@@ -26,6 +27,8 @@ for (const protocol of ["openai", "anthropic"] as const) {
         _setStoreForTest(new SessionStore({ enabled: false }));
         setRegistryForTest({});
         const sent: Record<string, unknown>[] = [];
+        const logs: string[] = [];
+        const refreshTimeoutMs = protocol === "openai" ? 700 : 900;
         const upstream = http.createServer(async (req, res) => {
             const parts: Buffer[] = [];
             for await (const part of req) parts.push(Buffer.from(part));
@@ -46,7 +49,7 @@ for (const protocol of ["openai", "anthropic"] as const) {
         const origin = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
         const opts: ProxyOptions = {
             port: 0, host: "127.0.0.1", upstream: origin,
-            routes: { [origin]: { models: { "plain-test": { context: 400_000 } }, cacheKeepalive: { refreshAfterCompress: true } } },
+            routes: { [origin]: { models: { "plain-test": { context: 400_000, ...(protocol === "openai" ? { cacheKeepalive: { refreshTimeoutMs: 700 } } : {}) } }, cacheKeepalive: { refreshAfterCompress: true, refreshTimeoutMs: 900 } } },
             modelContextLimit: 400_000, kernelConfig: defaultConfig(400_000),
             compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" },
             sessionHeader: "x-acp-session", log: false, debug: false,
@@ -68,6 +71,7 @@ for (const protocol of ["openai", "anthropic"] as const) {
             assert.equal(response.status, 200);
             assert.match(await response.text(), /reply/);
         };
+        setLogCapture((_level, message) => logs.push(message));
         try {
             await post("OLD B");
             assert.equal(sent.length, 1);
@@ -75,6 +79,9 @@ for (const protocol of ["openai", "anthropic"] as const) {
             await post("NEW C");
             assert.equal(sent.length, 3, "initial normal, prefix-only warm, post-fold normal");
             assert.equal(sent[1].max_tokens, 1);
+            const warmLog = logs.find(x => x.includes("[cache-prefix-refresh] success"));
+            assert(warmLog);
+            assert.match(warmLog, new RegExp(`timeoutMs=${refreshTimeoutMs}\\b`), "resolved provider/model timeout reaches the real relay hook");
             assert.equal(sent[1].stream, false);
             assert.match(JSON.stringify(sent[1].messages), /stable first A/);
             assert.doesNotMatch(JSON.stringify(sent[1].messages), /OLD B|NEW C|stable tail/);
@@ -83,6 +90,7 @@ for (const protocol of ["openai", "anthropic"] as const) {
             assert.equal(lines.length, 2, "warm usage must not be inserted into conversation ledger");
             assert(lines.every(line => line.input === 100), "warm's synthetic 999-token usage never poisons main accounting");
         } finally {
+            setLogCapture(null);
             await close(proxy);
             await close(upstream);
             setRegistryForTest({});

@@ -485,6 +485,13 @@ entries:
     desc_en: "Send one unchanged legal prefix before the first post-compression request. Anthropic/Chat cap output at 1 token; plain Responses at 16. Independent of idle enabled; model > provider > global. Unsupported shapes skip; failures continue the real request without retry. Extra usage may be billed."
     desc_zh: "压缩后首次请求前，单独请求一次未变化且协议合法的前缀。Anthropic/Chat 输出上限 1 token，普通 Responses 为 16。独立于空闲保活 enabled；模型 > provider > 全局。不支持的形状跳过，失败不重试并继续正式请求；额外用量可能计费。"
     desc_ja: "圧縮後最初のリクエスト前に、不変で有効なプレフィックスを一度送信。Anthropic/Chat の出力上限は1トークン、通常の Responses は16。アイドル enabled とは独立。モデル > プロバイダ > 全体。未対応形式はスキップし、失敗しても再試行せず本来のリクエストを続行。追加料金が発生する場合がある。"
+  - key: cacheKeepalive.refreshTimeoutMs
+    type: number
+    default: "10000"
+    group: behavior
+    desc_en: "Deadline in milliseconds for the one-shot post-compression prefix refresh, not a fixed delay. Finite integer 1..120000; invalid values are rejected. Model > provider > global > 10000. Early completion forwards the real request immediately; timeout continues without retry. No environment variable or CLI override."
+    desc_zh: "压缩后单次前缀刷新等待上限（毫秒），不是固定延迟。有限整数 1..120000，非法值拒绝。模型 > provider > 全局 > 10000。提前完成立即放行正式请求；超时后继续且不重试。无环境变量或 CLI 覆盖。"
+    desc_ja: "圧縮後プレフィックス更新の待機上限（ミリ秒）。固定待機ではない。有限整数1..120000、無効値は拒否。モデル > プロバイダ > 全体 > 10000。早く完了すれば直ちに本来のリクエストを送信し、期限切れでも再試行せず続行。環境変数・CLI指定なし。"
   - key: cacheKeepalive.ttlFactor
     type: number
     default: "0.9"

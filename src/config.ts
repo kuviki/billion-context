@@ -148,6 +148,9 @@ export type ProviderRoute = {
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
+export const DEFAULT_CACHE_REFRESH_TIMEOUT_MS = 10_000;
+export const MAX_CACHE_REFRESH_TIMEOUT_MS = 120_000;
+
 /** #3376: idle prompt-cache keepalive settings (Anthropic wire only, v1).
  *  While a session is idle, bili replays the EXACT last accepted upstream
  *  body (max_tokens=1, stream=false) at cadence ≈ TTL tier × ttlFactor so the
@@ -162,6 +165,8 @@ export interface CacheKeepaliveSettings {
     enabled?: boolean;
     /** One prefix-only request before the first post-compression send. Default false; independent of the idle timer. */
     refreshAfterCompress?: boolean;
+    /** Prefix refresh deadline in ms, integer 1..120000. Default 10000; early completion proceeds immediately. */
+    refreshTimeoutMs?: number;
     /** Cadence factor applied to the TTL tier (default 0.9 → 5m tier pings
      *  every ~4.5 min, 1h tier every ~54 min). Must be in (0, 1]. */
     ttlFactor?: number;
@@ -3181,7 +3186,7 @@ export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; ma
 // THROWS (config-load failure) instead of being silently dropped, so a
 // typo'd keepalive config can't leave the user wondering why idle sessions
 // cold-rebuild every time.
-const CACHE_KEEPALIVE_FIELDS = ["enabled", "refreshAfterCompress", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
+const CACHE_KEEPALIVE_FIELDS = ["enabled", "refreshAfterCompress", "refreshTimeoutMs", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
 
 export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings | undefined {
     if (v === undefined) return undefined;
@@ -3199,6 +3204,12 @@ export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings 
                 throw new Error(`[acp-config] cacheKeepalive.${key} must be a boolean (got ${JSON.stringify(obj[key])})`);
             out[key] = obj[key];
         }
+    }
+    if ("refreshTimeoutMs" in obj) {
+        const n = obj.refreshTimeoutMs;
+        if (typeof n !== "number" || !Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > MAX_CACHE_REFRESH_TIMEOUT_MS)
+            throw new Error(`[acp-config] cacheKeepalive.refreshTimeoutMs must be an integer in [1, 120000] milliseconds (got ${JSON.stringify(n)})`);
+        out.refreshTimeoutMs = n;
     }
     if ("ttlFactor" in obj) {
         const n = obj.ttlFactor;

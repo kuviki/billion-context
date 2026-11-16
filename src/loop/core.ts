@@ -290,6 +290,7 @@ export interface LoopCtx {
 
 export interface RequestOptions {
     refreshAfterCompress?: boolean;
+    refreshTimeoutMs?: number;
     prefixRefreshUnsupported?: boolean;
     url: string;
     /** Exact request model when this wire carries it in a URL/envelope instead of the body. */
@@ -686,6 +687,7 @@ export async function* runCompressLoop(
         // NEXT client turn without changing loop behavior mid-flight).
         const acceptPrefixSnapshot = await beforeCachePrefixRefresh({
             session: ctx.session, enabled: requestOptions.refreshAfterCompress === true,
+            timeoutMs: requestOptions.refreshTimeoutMs,
             protocol: ctx.protocol, body: wireBodyStr, url: requestOptions.url,
             headers: requestOptions.headers, dispatcher: ctx.proxyUrl ? proxyDispatcher(ctx.proxyUrl) : undefined,
             signal, unsupported: requestOptions.prefixRefreshUnsupported,
