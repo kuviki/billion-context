@@ -814,11 +814,11 @@ test("native search does not relax unknown top-level tools or other effect guard
 });
 
 for (const tool of [{ type: "code_interpreter", container: { type: "auto" } }, { type: "file_search", vector_store_ids: ["vs_synthetic"] }, { type: "image_generation" }, { type: "unknown", vendor_option: { keep: true } }, { type: "web_search_future" }]) {
-    test(`nested ${tool.type} warms with calls disabled and leaves formal request unchanged`, async () => {
+    test(`nested ${tool.type} warms with the formal tool choice unchanged`, async () => {
         for (const tool_choice of [undefined, "auto", "required", "none", { type: "none" }, { type: "unknown" }]) {
             const tools = [toolNamespace([namespaceLeafCustom, { type: "web_search" }, toolNamespace([tool], "nested")])];
             const [old, current] = namespacedBodies(tools);
-            if (tool_choice !== undefined) old.tool_choice = current.tool_choice = tool_choice;
+            if (tool_choice !== undefined) current.tool_choice = tool_choice;
             const original = JSON.stringify(current);
             const s = session();
             const start = requests.length;
@@ -827,7 +827,7 @@ for (const tool of [{ type: "code_interpreter", container: { type: "auto" } }, {
             await warm(s, current, { protocol: "responses" });
             assert.equal(requests.length, start + 1);
             assert.equal(JSON.stringify(requests[start].body.tools), JSON.stringify(tools));
-            assert.deepEqual(requests[start].body, { ...current, input: A, max_output_tokens: 16, store: false, tool_choice: "none" });
+            assert.deepEqual(requests[start].body, { ...current, input: A, max_output_tokens: 16, store: false });
             assert.equal(JSON.stringify(current), original);
             const main = await fetch(url, { method: "POST", body: JSON.stringify(current) });
             await main.text();
@@ -868,7 +868,7 @@ for (const statusCode of [400, 429, 503]) test(`native search warm HTTP ${status
 });
 
 
-for (const nested of [false, true]) test(`Responses remote MCP/connector nested=${nested} warms with calls off and exact declarations`, async () => {
+for (const nested of [false, true]) test(`Responses remote MCP/connector nested=${nested} warms with exact declarations and formal tool choice`, async () => {
     for (const tool of [
         { type: "mcp", server_label: "remote", server_url: "https://not-called.invalid", authorization: "synthetic-not-a-secret", require_approval: "always", allowed_tools: ["read_item"] },
         { type: "mcp", server_label: "connected", connector_id: "connector_synthetic", require_approval: "always" },
@@ -879,7 +879,7 @@ for (const nested of [false, true]) test(`Responses remote MCP/connector nested=
     ]) for (const tool_choice of [undefined, "auto", "none", { type: "none" }, { type: "mcp", server_label: "remote", name: "read_item" }]) {
         const tools = nested ? [toolNamespace([namespaceLeafFunction, toolNamespace([tool], "nested")])] : [tool];
         const [old, current] = namespacedBodies(tools);
-        if (tool_choice !== undefined) old.tool_choice = current.tool_choice = tool_choice;
+        if (tool_choice !== undefined) current.tool_choice = tool_choice;
         const original = JSON.stringify(current);
         const s = session();
         const start = requests.length;
@@ -889,7 +889,7 @@ for (const nested of [false, true]) test(`Responses remote MCP/connector nested=
         await beforeCachePrefixRefresh(input(s, current, { protocol: "responses" }));
         assert.equal(requests.length, start + 1, "one mock warm only; bili does not contact or execute remote tools");
         assert.equal(JSON.stringify(requests[start].body.tools), JSON.stringify(tools));
-        assert.deepEqual(requests[start].body, { ...current, input: A, max_output_tokens: 16, store: false, tool_choice: "none" });
+        assert.deepEqual(requests[start].body, { ...current, input: A, max_output_tokens: 16, store: false });
         assert.equal(JSON.stringify(current), original);
         assert(logs.at(-1)?.includes("retry=0"));
         assert(!logs.some(x => x.includes("synthetic-not-a-secret") || x.includes("not-called.invalid")));

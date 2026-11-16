@@ -45,30 +45,28 @@ function remoteToolDeclaration(tool: Json): boolean {
     return typeof tool.type === "string" && tool.type.trim().length > 0 && (tool.type === "mcp" || tool.type === "connector" || tool.server_url !== undefined || tool.connector_id !== undefined);
 }
 
-function responsesNamespacePolicy(tool: Json): "allowed" | "disabled" | "invalid" {
+function validResponsesNamespace(tool: Json): boolean {
     const pending: unknown[] = [tool];
-    let disableTools = false;
     while (pending.length > 0) {
         const item = pending.pop();
-        if (!obj(item) || typeof item.type !== "string" || item.type.trim().length === 0) return "invalid";
+        if (!obj(item) || typeof item.type !== "string" || item.type.trim().length === 0) return false;
         if (item.type === "namespace") {
-            if (typeof item.name !== "string" || item.name.trim().length === 0 || !Array.isArray(item.tools) || item.tools.length === 0) return "invalid";
-            if (remoteToolDeclaration(item)) disableTools = true;
+            if (typeof item.name !== "string" || item.name.trim().length === 0 || !Array.isArray(item.tools) || item.tools.length === 0) return false;
             for (const child of item.tools) pending.push(child);
             continue;
         }
-        if (remoteToolDeclaration(item)) { disableTools = true; continue; }
+        if (remoteToolDeclaration(item)) continue;
         if (nativeWebSearch(item, "responses")) continue;
         if (["function", "custom"].includes(item.type) || item.name !== undefined) {
-            if (typeof item.name !== "string" || item.name.trim().length === 0) return "invalid";
+            if (typeof item.name !== "string" || item.name.trim().length === 0) return false;
         }
         if (item.type === "function") {
-            if (item.parameters != null && !obj(item.parameters)) return "invalid";
+            if (item.parameters != null && !obj(item.parameters)) return false;
         } else if (item.type === "custom") {
-            if (item.format != null && (!obj(item.format) || (item.format.type !== "text" && !(item.format.type === "grammar" && (item.format.syntax === "lark" || item.format.syntax === "regex") && typeof item.format.definition === "string")))) return "invalid";
-        } else disableTools = true;
+            if (item.format != null && (!obj(item.format) || (item.format.type !== "text" && !(item.format.type === "grammar" && (item.format.syntax === "lark" || item.format.syntax === "regex") && typeof item.format.definition === "string")))) return false;
+        }
     }
-    return disableTools ? "disabled" : "allowed";
+    return true;
 }
 
 function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefined {
@@ -93,8 +91,7 @@ function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefi
     if (body.tools !== undefined && !Array.isArray(body.tools)) return "unknown-tools-shape";
     if (inp.protocol === "responses" && Array.isArray(body.tools)) {
         for (const tool of body.tools) if (obj(tool) && tool.type === "namespace") {
-            const policy = responsesNamespacePolicy(tool);
-            if (policy === "invalid") return "server-or-unknown-tools";
+            if (!validResponsesNamespace(tool)) return "server-or-unknown-tools";
         }
     }
     if (!noTools && Array.isArray(body.tools) && body.tools.some(t => !obj(t) || (!nativeWebSearch(t, inp.protocol) && (inp.protocol === "anthropic" ? t.type !== undefined && t.type !== "custom" : t.type !== "function" && t.type !== "custom" && !(inp.protocol === "responses" && (t.type === "namespace" || remoteToolDeclaration(t))))))) return "server-or-unknown-tools";
@@ -187,7 +184,6 @@ export function buildPrefixRefreshBody(previous: Json, current: Json, protocol: 
     while (count > 0 && !ends.has(count)) count--;
     if (count === 0) return { unchanged: false, reason: protocol === "responses" && current.instructions ? "static-only-responses-unverified" : "no-legal-common-prefix" };
     const warm: Json = { ...current, [key]: items.slice(0, count) };
-    if (protocol === "responses" && Array.isArray(current.tools) && current.tools.some(t => obj(t) && (remoteToolDeclaration(t) || (t.type === "namespace" && responsesNamespacePolicy(t) === "disabled")))) warm.tool_choice = "none";
     delete warm.max_tokens;
     delete warm.max_completion_tokens;
     delete warm.max_output_tokens;
