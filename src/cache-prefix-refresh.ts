@@ -45,7 +45,15 @@ function remoteToolDeclaration(tool: Json): boolean {
     return typeof tool.type === "string" && tool.type.trim().length > 0 && (tool.type === "mcp" || tool.type === "connector" || tool.server_url !== undefined || tool.connector_id !== undefined);
 }
 
-function validResponsesNamespace(tool: Json): boolean {
+// Explicit BYOT/client search only. Omitted execution means hosted search,
+// not a client declaration; unknown fields must not bypass this via MCP gates.
+function validClientToolSearch(tool: Json): boolean {
+    return tool.type === "tool_search" && tool.execution === "client" && obj(tool.parameters) &&
+        (tool.description === undefined || typeof tool.description === "string") &&
+        Object.keys(tool).every(k => ["type", "execution", "parameters", "description"].includes(k));
+}
+
+function validResponsesNamespace(tool: Json, toolsDisabled = false): boolean {
     const pending: unknown[] = [tool];
     while (pending.length > 0) {
         const item = pending.pop();
@@ -53,6 +61,10 @@ function validResponsesNamespace(tool: Json): boolean {
         if (item.type === "namespace") {
             if (typeof item.name !== "string" || item.name.trim().length === 0 || !Array.isArray(item.tools) || item.tools.length === 0) return false;
             for (const child of item.tools) pending.push(child);
+            continue;
+        }
+        if (item.type === "tool_search" && !toolsDisabled) {
+            if (!validClientToolSearch(item)) return false;
             continue;
         }
         if (remoteToolDeclaration(item)) continue;
@@ -90,6 +102,24 @@ function validAdditionalTools(item: Json): boolean {
     return true;
 }
 
+// Historical MCP discovery result, not a live server/tool declaration.
+function validMcpListing(item: Json): boolean {
+    if (Object.keys(item).some(k => !["type", "id", "server_label", "tools", "error"].includes(k))) return false;
+    if (typeof item.id !== "string" || item.id.trim() === "" || typeof item.server_label !== "string" || item.server_label.trim() === "") return false;
+    if (item.error != null || !Array.isArray(item.tools)) return false;
+    return item.tools.every(tool => obj(tool) && typeof tool.name === "string" && tool.name.trim() !== "" && obj(tool.input_schema) &&
+        (tool.description == null || typeof tool.description === "string") && (tool.annotations == null || obj(tool.annotations)) &&
+        Object.keys(tool).every(k => ["name", "input_schema", "description", "annotations"].includes(k)));
+}
+
+function validClientSearchItem(item: Json, output: boolean): item is Json & { call_id: string } {
+    const keys = output ? ["type", "id", "call_id", "execution", "status", "tools"] : ["type", "id", "call_id", "execution", "status", "arguments"];
+    if (Object.keys(item).some(k => !keys.includes(k)) || item.execution !== "client" ||
+        typeof item.call_id !== "string" || item.call_id.trim() === "" ||
+        (item.id != null && typeof item.id !== "string") || (item.status !== undefined && item.status !== "completed")) return false;
+    return output ? Array.isArray(item.tools) && (item.tools.length === 0 || validAdditionalTools({ type: "additional_tools", tools: item.tools })) : obj(item.arguments);
+}
+
 function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefined {
     if (inp.unsupportedReason) return inp.unsupportedReason;
     if (inp.unsupported) return "unsupported-wire-transform";
@@ -111,11 +141,12 @@ function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefi
     const noTools = body.tool_choice === "none" || (obj(body.tool_choice) && body.tool_choice.type === "none");
     if (body.tools !== undefined && !Array.isArray(body.tools)) return "unknown-tools-shape";
     if (inp.protocol === "responses" && Array.isArray(body.tools)) {
-        for (const tool of body.tools) if (obj(tool) && tool.type === "namespace") {
-            if (!validResponsesNamespace(tool)) return "server-or-unknown-tools";
+        for (const tool of body.tools) if (obj(tool)) {
+            if (!noTools && tool.type === "tool_search" && !validClientToolSearch(tool)) return "server-or-unknown-tools";
+            if (tool.type === "namespace" && !validResponsesNamespace(tool, noTools)) return "server-or-unknown-tools";
         }
     }
-    if (!noTools && Array.isArray(body.tools) && body.tools.some(t => !obj(t) || (!nativeWebSearch(t, inp.protocol) && (inp.protocol === "anthropic" ? t.type !== undefined && t.type !== "custom" : t.type !== "function" && t.type !== "custom" && !(inp.protocol === "responses" && (t.type === "namespace" || remoteToolDeclaration(t))))))) return "server-or-unknown-tools";
+    if (!noTools && Array.isArray(body.tools) && body.tools.some(t => !obj(t) || (!nativeWebSearch(t, inp.protocol) && (inp.protocol === "anthropic" ? t.type !== undefined && t.type !== "custom" : t.type !== "function" && t.type !== "custom" && !(inp.protocol === "responses" && (t.type === "namespace" || validClientToolSearch(t) || remoteToolDeclaration(t))))))) return "server-or-unknown-tools";
     if (inp.protocol === "responses") {
         const endpoint = new URL(inp.url);
         if (endpoint.hostname === "chatgpt.com" && endpoint.pathname.startsWith("/backend-api/")) return "codex-oauth-output-cap-unsupported";
@@ -139,8 +170,11 @@ function parseSnapshot(inp: PrefixRefreshInput): { snapshot?: Snapshot; reason?:
 function safeEnds(items: unknown[], protocol: WireProtocol, body: Json): Set<number> {
     const ends = new Set<number>();
     const calls = new Set<string>();
+    const searchCalls = new Set<string>();
+    const seenSearchCalls = new Set<string>();
     let reasoningPending = false;
     let responsesDeclarationPrefix = true;
+    let mcpListingPrefix = true;
     const noAnthropicPrefill = (obj(body.thinking) && body.thinking.type !== "disabled") || /claude-(?:opus-4-[67]|sonnet-4-6|mythos-preview)(?:-|$)/i.test(String(body.model));
     for (let i = 0; i < items.length; i++) {
         const item = items[i];
@@ -175,20 +209,30 @@ function safeEnds(items: unknown[], protocol: WireProtocol, body: Json): Set<num
             if (item.role === "tool" && (typeof item.tool_call_id !== "string" || !calls.delete(item.tool_call_id))) break;
             if (item.role === "function" && (typeof item.name !== "string" || !calls.delete(`legacy:${item.name}`))) break;
         } else {
-            if (item.type === "additional_tools") {
-                if (!responsesDeclarationPrefix || !validAdditionalTools(item)) break;
+            if (item.type === "additional_tools" || item.type === "mcp_list_tools") {
+                if (!(item.type === "additional_tools" ? responsesDeclarationPrefix && validAdditionalTools(item) : mcpListingPrefix && validMcpListing(item))) break;
                 // Preserve the whole item via the final prefix slice, but do
                 // not let declarations alone become a warm-up endpoint.
                 continue;
             }
             responsesDeclarationPrefix = false;
+            if (!((item.type === undefined || item.type === "message") && (item.role === "system" || item.role === "developer"))) mcpListingPrefix = false;
             if (item.status === "in_progress") break;
-            if (item.type === "function_call" || item.type === "custom_tool_call") {
+            if (item.type === "tool_search_call") {
+                if (!validClientSearchItem(item, false) || calls.has(item.call_id) || seenSearchCalls.has(item.call_id)) break;
+                calls.add(item.call_id);
+                searchCalls.add(item.call_id);
+                seenSearchCalls.add(item.call_id);
+                reasoningPending = false;
+            } else if (item.type === "tool_search_output") {
+                if (!validClientSearchItem(item, true) || !searchCalls.delete(item.call_id)) break;
+                calls.delete(item.call_id);
+            } else if (item.type === "function_call" || item.type === "custom_tool_call") {
                 if (typeof item.call_id !== "string" || calls.has(item.call_id)) break;
                 calls.add(item.call_id);
                 reasoningPending = false;
             } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
-                if (typeof item.call_id !== "string" || !calls.delete(item.call_id)) break;
+                if (typeof item.call_id !== "string" || searchCalls.has(item.call_id) || !calls.delete(item.call_id)) break;
             } else if (item.type === "reasoning") {
                 reasoningPending = true;
             } else if (item.type === undefined || item.type === "message") {

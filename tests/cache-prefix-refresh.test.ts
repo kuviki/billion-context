@@ -1075,3 +1075,82 @@ test("real Responses codec additional_tools reaches HTTP warm-up without droppin
     assert.equal(requests.length, 2, "warm-up then unchanged main request, no dispatch of returned calls");
     assert.deepEqual(requests[1].body, current);
 });
+
+const mcpListing = (): Json => ({ type: "mcp_list_tools", id: "synthetic-list", server_label: "synthetic-server", tools: [{ name: "read_file", input_schema: { type: "object", properties: { path: { type: "string" } } }, description: "Read synthetic file", annotations: { readOnlyHint: true } }] });
+const clientSearch = (): Json => ({ type: "tool_search", execution: "client", description: "Search client tools", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } });
+const searchPair = (): [Json, Json] => [
+    { type: "tool_search_call", call_id: "synthetic-search", status: "completed", execution: "client", arguments: { query: "read file" } },
+    { type: "tool_search_output", id: "synthetic-output", call_id: "synthetic-search", status: "completed", execution: "client", tools: [toolNamespace([namespaceLeafFunction])] },
+];
+
+test("mcp_list_tools leading inert listings preserve bytes but are not endpoints", () => {
+    const listing = mcpListing();
+    const prefix = [additionalTools(), listing];
+    const [old, current] = additionalBodies(prefix);
+    const warm = JSON.parse(buildPrefixRefreshBody(old, current, "responses").body!);
+    assert.deepEqual(warm.input, [...prefix, ...A]);
+    const head = { type: "message", role: "developer", content: "head instruction" };
+    const [headOld, headCurrent] = additionalBodies([head, listing]);
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(headOld, headCurrent, "responses").body!).input, [head, listing, ...A]);
+    assert.equal(buildPrefixRefreshBody(old, { ...current, input: [...prefix, ...C] }, "responses").body, undefined);
+    assert.equal(buildPrefixRefreshBody(old, { ...current, input: [additionalTools(), { ...listing, server_label: "changed" }, ...A, ...C] }, "responses").body, undefined);
+    const [laterOld, laterCurrent] = additionalBodies([...A, listing]);
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(laterOld, laterCurrent, "responses").body!).input, A);
+    for (const invalid of [
+        { ...listing, id: undefined }, { ...listing, server_label: "" }, { ...listing, tools: {} }, { ...listing, error: "failed" },
+        { ...listing, server_url: "https://never-called.invalid" }, { ...listing, tools: [{ type: "function", name: "tool", input_schema: {} }] },
+        { ...listing, tools: [{ name: "tool", input_schema: [], annotations: {} }] },
+        { ...listing, tools: [{ name: "tool", input_schema: {}, execution: "server" }] },
+    ]) {
+        const [a, b] = additionalBodies([invalid]);
+        assert.equal(buildPrefixRefreshBody(a, b, "responses").body, undefined);
+    }
+});
+
+test("completed explicit-client search pairs are exact legal boundaries, unlike orphan/server/unknown records", () => {
+    const [call, output] = searchPair();
+    const prefix = [mcpListing(), ...A];
+    const build = (history: unknown[]) => {
+        const [old, current] = additionalBodies([...prefix, ...history]);
+        return JSON.parse(buildPrefixRefreshBody(old, current, "responses").body!);
+    };
+    for (const history of [[call, output], [call, { ...output, tools: [] }], [{ type: "reasoning", encrypted_content: "synthetic" }, call, output]]) {
+        assert.deepEqual(build(history).input, [...prefix, ...history, ...A]);
+    }
+    for (const history of [
+        [call], [output], [call, { ...output, call_id: "wrong" }], [call, { type: "function_call_output", call_id: call.call_id, output: "not search" }],
+        [{ type: "function_call", call_id: call.call_id, name: "read_file", arguments: "{}" }, output],
+        [{ ...call, execution: "server" }, output], [{ ...call, execution: undefined }, output], [{ ...call, arguments: "{}" }, output],
+        [{ ...call, status: "in_progress" }, output], [call, { ...output, status: "incomplete" }],
+        [call, { ...output, execution: "server" }], [call, { ...output, tools: [{ type: "web_search" }] }],
+        [call, { ...output, tools: [toolNamespace([{ type: "mcp", server_url: "https://never-called.invalid" }])] }],
+        [call, { ...output, unknown_control: true }], [call, call, output],
+    ]) assert.deepEqual(build(history).input, prefix, JSON.stringify(history));
+    assert.deepEqual(build([call, output, call, output]).input, [...prefix, call, output], "duplicate search ID cannot open a second group");
+});
+
+test("top-level tool_search enables only validated explicit client mode, preserving disabled-tool legacy", async () => {
+    for (const tools of [[clientSearch()], [toolNamespace([clientSearch()])]]) {
+        const s = session(); const [old, current] = additionalBodies([mcpListing(), ...searchPair()]); old.tools = current.tools = tools;
+        response = { status: "completed", output: [{ type: "tool_search_call", execution: "client", call_id: "never-run", arguments: { query: "ignored" } }] };
+        const before = requests.length;
+        await prime(s, old, { protocol: "responses" }); await warm(s, current, { protocol: "responses" });
+        assert.equal(requests.length, before + 1);
+        assert.deepEqual(requests[before].body.tools, tools);
+        assert.deepEqual(requests[before].body.input, [mcpListing(), ...searchPair(), ...A]);
+    }
+    for (const tool of [{ type: "tool_search" }, { ...clientSearch(), execution: "server" }, { ...clientSearch(), server_url: "https://never-called.invalid" }, { ...clientSearch(), connector_id: "synthetic" }, { ...clientSearch(), parameters: [] }, { ...clientSearch(), unknown_control: true }]) {
+        for (const tools of [[tool], [toolNamespace([tool])]]) {
+            const s = session(), [old, current] = additionalBodies([mcpListing()]); old.tools = current.tools = tools;
+            const before = requests.length;
+            await prime(s, old, { protocol: "responses" }); await warm(s, current, { protocol: "responses" });
+            assert.equal(requests.length, before);
+            assert.ok(logs.at(-1)?.includes("server-or-unknown-tools"));
+        }
+    }
+    const s = session(), [old, current] = additionalBodies([mcpListing()]);
+    old.tools = current.tools = [{ type: "tool_search" }]; old.tool_choice = current.tool_choice = "none";
+    const before = requests.length;
+    await prime(s, old, { protocol: "responses" }); await warm(s, current, { protocol: "responses" });
+    assert.equal(requests.length, before + 1); assert.equal(requests[before].body.tool_choice, "none");
+});
