@@ -21,8 +21,8 @@ async function close(server: http.Server): Promise<void> {
     await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
-for (const protocol of ["openai", "anthropic"] as const) for (const stream of [false, true]) {
-    test(`real ${protocol} stream=${stream} relay runs provider-enabled prefix refresh before main and isolates usage`, { timeout: 20_000 }, async () => {
+for (const protocol of ["openai", "anthropic"] as const) for (const stream of [false, true]) for (const search of [false, true]) {
+    test(`real ${protocol} stream=${stream} search=${search} relay runs provider-enabled prefix refresh before main and isolates usage`, { timeout: 20_000 }, async () => {
         _resetPrefixRefreshForTest();
         _setStoreForTest(new SessionStore({ enabled: false }));
         setRegistryForTest({});
@@ -72,14 +72,17 @@ for (const protocol of ["openai", "anthropic"] as const) for (const stream of [f
         };
         const proxy = await startServer(opts);
         if (!proxy.listening) await once(proxy, "listening");
-        const sid = `refresh-http-${protocol}-${stream}`;
+        const sid = `refresh-http-${protocol}-${stream}-${search}`;
+        const searchSettings = !search ? {} : protocol === "openai"
+            ? { web_search_options: { search_context_size: "low" }, tool_choice: "auto" }
+            : { tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }, { name: "client_tool", input_schema: { type: "object", properties: {} } }], tool_choice: { type: "auto" } };
         const endpoint = protocol === "anthropic" ? "/v1/messages" : "/v1/chat/completions";
         const url = `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/${origin}${endpoint}`;
         const post = async (suffix: string) => {
             const response = await fetch(url, {
                 method: "POST", signal: AbortSignal.timeout(10_000),
                 headers: { "content-type": "application/json", "x-acp-session": sid, "x-api-key": "synthetic-key" },
-                body: JSON.stringify({ model: "plain-test", stream, ...(protocol === "openai" && stream ? { stream_options: { include_usage: false } } : {}), max_tokens: 4000, messages: [{ role: "user", content: "stable first A" }, { role: "assistant", content: suffix }, { role: "user", content: "stable tail" }] }),
+                body: JSON.stringify({ model: "plain-test", stream, ...searchSettings, ...(protocol === "openai" && stream ? { stream_options: { include_usage: false } } : {}), max_tokens: 4000, messages: [{ role: "user", content: "stable first A" }, { role: "assistant", content: suffix }, { role: "user", content: "stable tail" }] }),
             });
             assert.equal(response.status, 200);
             assert.match(await response.text(), /reply/);
@@ -97,6 +100,7 @@ for (const protocol of ["openai", "anthropic"] as const) for (const stream of [f
             assert.match(warmLog, new RegExp(`timeoutMs=${refreshTimeoutMs}\\b`), "resolved provider/model timeout reaches the real relay hook");
             assert.equal(sent[1].stream, stream);
             assert.deepEqual(sent[1].stream_options, sent[2].stream_options, "preserve stream_options exactly without enabling usage");
+            for (const field of ["web_search_options", "tools", "tool_choice"]) assert.deepEqual(sent[1][field], sent[2][field], `warm keeps final formal ${field}`);
             assert.match(JSON.stringify(sent[1].messages), /stable first A/);
             assert.doesNotMatch(JSON.stringify(sent[1].messages), /OLD B|NEW C|stable tail/);
             assert.match(JSON.stringify(sent[2].messages), /NEW C/);

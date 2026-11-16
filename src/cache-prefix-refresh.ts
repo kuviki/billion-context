@@ -13,7 +13,7 @@ type Json = Record<string, unknown>;
 type Snapshot = { body: Json; namespace: string; order: number; skipReason?: string };
 type RefreshState = { last?: Snapshot; pending?: Snapshot; active?: Promise<void>; order: number };
 let states = new WeakMap<Session, RefreshState>();
-const promptFields = ["model", "system", "instructions", "tools", "functions", "tool_choice", "function_call", "parallel_tool_calls", "response_format", "text", "prompt", "prompt_cache_key", "prompt_cache_retention", "thinking", "reasoning", "reasoning_effort", "enable_thinking", "chat_template_kwargs", "cache_control", "context_management", "user", "safety_identifier"];
+const promptFields = ["model", "system", "instructions", "tools", "functions", "tool_choice", "function_call", "parallel_tool_calls", "web_search_options", "response_format", "text", "prompt", "prompt_cache_key", "prompt_cache_retention", "thinking", "reasoning", "reasoning_effort", "enable_thinking", "chat_template_kwargs", "cache_control", "context_management", "user", "safety_identifier"];
 const obj = (v: unknown): v is Json => v !== null && typeof v === "object" && !Array.isArray(v);
 const equal = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 
@@ -36,21 +36,40 @@ export function noteCompressionForPrefixRefresh(session: Session): void {
     if (state?.last && !state.pending) state.pending = state.last;
 }
 
-function safeResponsesNamespace(tool: Json): boolean {
+function nativeWebSearch(tool: Json, protocol: WireProtocol | undefined): boolean {
+    if (typeof tool.type !== "string" || tool.server_url !== undefined || tool.connector_id !== undefined) return false;
+    if (protocol === "responses") return ["web_search", "web_search_2025_08_26", "web_search_preview", "web_search_preview_2025_03_11"].includes(tool.type);
+    return protocol === "anthropic" && tool.name === "web_search" && ["web_search_20250305", "web_search_20260209", "web_search_20260318"].includes(tool.type);
+}
+
+function remoteToolDeclaration(tool: Json): boolean {
+    return typeof tool.type === "string" && tool.type.trim().length > 0 && (tool.type === "mcp" || tool.type === "connector" || tool.server_url !== undefined || tool.connector_id !== undefined);
+}
+
+function responsesNamespacePolicy(tool: Json): "allowed" | "disabled" | "invalid" {
     const pending: unknown[] = [tool];
+    let disableTools = false;
     while (pending.length > 0) {
         const item = pending.pop();
-        if (!obj(item) || typeof item.name !== "string" || item.name.trim().length === 0) return false;
+        if (!obj(item) || typeof item.type !== "string" || item.type.trim().length === 0) return "invalid";
         if (item.type === "namespace") {
-            if (!Array.isArray(item.tools) || item.tools.length === 0) return false;
+            if (typeof item.name !== "string" || item.name.trim().length === 0 || !Array.isArray(item.tools) || item.tools.length === 0) return "invalid";
+            if (remoteToolDeclaration(item)) disableTools = true;
             for (const child of item.tools) pending.push(child);
-        } else if (item.type === "function") {
-            if (item.parameters != null && !obj(item.parameters)) return false;
+            continue;
+        }
+        if (remoteToolDeclaration(item)) { disableTools = true; continue; }
+        if (nativeWebSearch(item, "responses")) continue;
+        if (["function", "custom"].includes(item.type) || item.name !== undefined) {
+            if (typeof item.name !== "string" || item.name.trim().length === 0) return "invalid";
+        }
+        if (item.type === "function") {
+            if (item.parameters != null && !obj(item.parameters)) return "invalid";
         } else if (item.type === "custom") {
-            if (item.format != null && (!obj(item.format) || (item.format.type !== "text" && !(item.format.type === "grammar" && (item.format.syntax === "lark" || item.format.syntax === "regex") && typeof item.format.definition === "string")))) return false;
-        } else return false;
+            if (item.format != null && (!obj(item.format) || (item.format.type !== "text" && !(item.format.type === "grammar" && (item.format.syntax === "lark" || item.format.syntax === "regex") && typeof item.format.definition === "string")))) return "invalid";
+        } else disableTools = true;
     }
-    return true;
+    return disableTools ? "disabled" : "allowed";
 }
 
 function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefined {
@@ -62,7 +81,7 @@ function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefi
     if (body.container) return "server-container-state";
     if (body.background === true) return "background-response";
     if (body.mcp_servers != null && (!Array.isArray(body.mcp_servers) || body.mcp_servers.length > 0)) return "server-mcp-tools";
-    if (body.web_search_options !== undefined && body.web_search_options !== null) return "server-web-search";
+    if (body.web_search_options != null && (inp.protocol !== "openai" || !obj(body.web_search_options))) return "unknown-web-search-options";
     if (body.plugins != null && (!Array.isArray(body.plugins) || body.plugins.length > 0)) return "server-plugins";
     if (body.context_management != null && (!obj(body.context_management) || Object.keys(body.context_management).some(k => k !== "edits") || (body.context_management.edits !== undefined && (!Array.isArray(body.context_management.edits) || body.context_management.edits.length > 0)))) return "server-context-management";
     if (body.audio !== undefined || (Array.isArray(body.modalities) && body.modalities.some(m => m !== "text"))) return "non-text-output-cap-unverified";
@@ -73,8 +92,13 @@ function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefi
     if (inp.protocol === "anthropic" && obj(body.thinking) && body.thinking.type === "enabled" && !/interleaved-thinking/i.test(beta)) return "thinking-budget-exceeds-output-cap";
     const noTools = body.tool_choice === "none" || (obj(body.tool_choice) && body.tool_choice.type === "none");
     if (body.tools !== undefined && !Array.isArray(body.tools)) return "unknown-tools-shape";
-    if (inp.protocol === "responses" && Array.isArray(body.tools) && body.tools.some(t => obj(t) && t.type === "namespace" && !safeResponsesNamespace(t))) return "server-or-unknown-tools";
-    if (!noTools && Array.isArray(body.tools) && body.tools.some(t => !obj(t) || (inp.protocol === "anthropic" ? t.type !== undefined && t.type !== "custom" : t.type !== "function" && t.type !== "custom" && !(inp.protocol === "responses" && t.type === "namespace")))) return "server-or-unknown-tools";
+    if (inp.protocol === "responses" && Array.isArray(body.tools)) {
+        for (const tool of body.tools) if (obj(tool) && tool.type === "namespace") {
+            const policy = responsesNamespacePolicy(tool);
+            if (policy === "invalid") return "server-or-unknown-tools";
+        }
+    }
+    if (!noTools && Array.isArray(body.tools) && body.tools.some(t => !obj(t) || (!nativeWebSearch(t, inp.protocol) && (inp.protocol === "anthropic" ? t.type !== undefined && t.type !== "custom" : t.type !== "function" && t.type !== "custom" && !(inp.protocol === "responses" && (t.type === "namespace" || remoteToolDeclaration(t))))))) return "server-or-unknown-tools";
     if (inp.protocol === "responses") {
         const endpoint = new URL(inp.url);
         if (endpoint.hostname === "chatgpt.com" && endpoint.pathname.startsWith("/backend-api/")) return "codex-oauth-output-cap-unsupported";
@@ -165,6 +189,7 @@ export function buildPrefixRefreshBody(previous: Json, current: Json, protocol: 
     while (count > 0 && !ends.has(count)) count--;
     if (count === 0) return { unchanged: false, reason: protocol === "responses" && current.instructions ? "static-only-responses-unverified" : "no-legal-common-prefix" };
     const warm: Json = { ...current, [key]: items.slice(0, count) };
+    if (protocol === "responses" && Array.isArray(current.tools) && current.tools.some(t => obj(t) && (remoteToolDeclaration(t) || (t.type === "namespace" && responsesNamespacePolicy(t) === "disabled")))) warm.tool_choice = "none";
     delete warm.max_tokens;
     delete warm.max_completion_tokens;
     delete warm.max_output_tokens;

@@ -190,7 +190,7 @@ test("namespace/model/credentials changes never warm the old namespace", async (
 test("unsupported request families skip, preserving availability", async () => {
     for (const extra of [
         { thinking: { type: "enabled", budget_tokens: 1024 } },
-        { tools: [{ type: "web_search_20250305", name: "web_search" }] },
+        { tools: [{ type: "web_fetch_20250910", name: "web_fetch" }] },
         { conversation: "conv-id" },
         { previous_response_id: "resp-id" },
         { mcp_servers: [{ url: "https://must-not-call.invalid" }] },
@@ -670,7 +670,7 @@ for (const tools of [
     });
 }
 
-test("Responses namespace recursively blocks malformed, unknown and hosted children, even with none", async () => {
+test("Responses namespace recursively blocks malformed children, even with none", async () => {
     const invalid: unknown[] = [
         { type: "namespace", name: "functions" }, toolNamespace([]), { ...toolNamespace([]), tools: null },
         { ...toolNamespace([namespaceLeafFunction]), name: "" },
@@ -679,10 +679,8 @@ test("Responses namespace recursively blocks malformed, unknown and hosted child
         toolNamespace([{ type: "custom", name: 1 }]),
         toolNamespace([{ type: "custom", name: "bad", format: [] }]),
         toolNamespace([{ type: "custom", name: "bad", format: { type: "grammar", syntax: "unknown", definition: "x" } }]),
-        toolNamespace([{ type: "web_search_preview" }]),
-        toolNamespace([toolNamespace([{ type: "mcp", name: "remote", server_url: "https://not-called.invalid" }], "nested")]),
-        toolNamespace([toolNamespace([{ type: "code_interpreter", name: "execute" }], "nested")]),
-        toolNamespace([toolNamespace([{ type: "unknown", name: "mystery" }], "nested")]),
+        toolNamespace([{ type: "" }]), toolNamespace([{ type: 1 }]),
+        toolNamespace([toolNamespace([{ type: "unknown", name: 1 }], "nested")]),
     ];
     for (const entry of invalid) for (const tool_choice of ["auto", "none"]) {
         const s = session();
@@ -726,5 +724,171 @@ test("namespace-qualified function and custom history already preserve paired ca
         const partial = buildPrefixRefreshBody(old, current, "responses");
         assert(partial.body);
         assert.deepEqual(JSON.parse(partial.body).input, A);
+    }
+});
+
+// Provider-native variants: OpenAI Responses API reference + Claude web-search tool reference.
+// https://developers.openai.com/api/reference/resources/responses/methods/create
+// https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+for (const type of ["web_search", "web_search_2025_08_26", "web_search_preview", "web_search_preview_2025_03_11"]) {
+    for (const nested of [false, true]) test(`Responses ${type} nested=${nested} preserves search options and choice`, async () => {
+        const search = { type, search_context_size: "low", user_location: { type: "approximate", country: "JP", city: "Tokyo" }, ...(type.startsWith("web_search_preview") ? {} : { external_web_access: false, filters: { allowed_domains: ["example.com"] } }) };
+        const tools = nested ? [toolNamespace([namespaceLeafFunction, toolNamespace([search], "search")])] : [search, namespaceLeafFunction];
+        const [old, current] = namespacedBodies(tools);
+        old.tool_choice = current.tool_choice = { type };
+        const original = JSON.stringify(current);
+        const s = session();
+        await prime(s, old, { protocol: "responses" });
+        response = { status: "completed", output: [{ type: "web_search_call", status: "completed", action: { type: "search", query: "discard this synthetic search" } }] };
+        await warm(s, current, { protocol: "responses" });
+        await beforeCachePrefixRefresh(input(s, current, { protocol: "responses" }));
+        assert.equal(requests.length, 1);
+        assert.equal(JSON.stringify(requests[0].body.tools), JSON.stringify(tools));
+        assert.deepEqual(requests[0].body, { ...current, input: A, max_output_tokens: 16, store: false });
+        assert.equal(JSON.stringify(current), original);
+        assert(logs.some(x => x.includes("success") && x.includes("retry=0")));
+    });
+}
+
+for (const type of ["web_search_20250305", "web_search_20260209", "web_search_20260318"]) {
+    test(`Anthropic ${type} keeps native search declaration and tool choice`, async () => {
+        const extras = { tools: [{ type, name: "web_search", max_uses: 1, allowed_domains: ["example.com"], allowed_callers: ["direct"], user_location: { type: "approximate", country: "JP" }, ...(type === "web_search_20260318" ? { response_inclusion: "excluded" } : {}) }], tool_choice: { type: "tool", name: "web_search" } };
+        const s = session();
+        const current = body([...A, ...C], extras);
+        const original = JSON.stringify(current);
+        await prime(s, body([...A, ...B], extras));
+        await warm(s, current);
+        assert.equal(requests.length, 1);
+        assert.deepEqual(requests[0].body, { ...current, messages: A, max_tokens: 1 });
+        assert.equal(JSON.stringify(current), original);
+    });
+}
+
+for (const options of [{}, { search_context_size: "high", user_location: { type: "approximate", approximate: { country: "JP", city: "Tokyo" } } }]) {
+    test("Chat web_search_options is preserved without a separate opt-in", async () => {
+        const extras = { web_search_options: options, tool_choice: "auto", stream: true, stream_options: { include_usage: false } };
+        const current = body([...A, ...C], extras);
+        const s = session();
+        response = { choices: [{ finish_reason: "stop" }] };
+        await prime(s, body([...A, ...B], extras), { protocol: "openai" });
+        await warm(s, current, { protocol: "openai" });
+        assert.equal(requests.length, 1);
+        assert.deepEqual(requests[0].body, { ...current, messages: A, max_tokens: 1 });
+    });
+}
+
+test("Chat search settings are prompt identity, not incidental metadata", async () => {
+    const s = session();
+    await prime(s, body([...A, ...B], { web_search_options: { search_context_size: "low" } }), { protocol: "openai" });
+    await warm(s, body([...A, ...C], { web_search_options: { search_context_size: "high" } }), { protocol: "openai" });
+    assert.equal(requests.length, 0);
+    assert(logs.some(x => x.includes("reason=prompt-or-route-identity-changed")));
+});
+
+test("native search does not relax unknown top-level tools or other effect guards", async () => {
+    const cases: [WireProtocol, Json, string][] = [
+        ["responses", { tools: [{ type: "web_search_future" }] }, "server-or-unknown-tools"],
+        ["responses", { tools: [{ type: ["web_search"] }] }, "server-or-unknown-tools"],
+        ["responses", { tools: [{ type: "web_search" }, { type: "code_interpreter", container: "auto" }] }, "server-or-unknown-tools"],
+        ["responses", { tools: [{ type: "unknown" }] }, "server-or-unknown-tools"],
+        ["anthropic", { tools: [{ type: "web_search_20990101", name: "web_search" }] }, "server-or-unknown-tools"],
+        ["anthropic", { tools: [{ type: "web_search_20250305", name: "not_search" }] }, "server-or-unknown-tools"],
+        ["anthropic", { tools: [{ type: "web_search_20250305", name: "web_search" }, { type: "web_fetch_20250910", name: "web_fetch" }] }, "server-or-unknown-tools"],
+        ["openai", { web_search_options: [], tool_choice: "auto" }, "unknown-web-search-options"],
+        ["openai", { web_search_options: {}, plugins: [{ id: "web" }] }, "server-plugins"],
+        ["responses", { web_search_options: {} }, "unknown-web-search-options"],
+    ];
+    for (const [protocol, extras, reason] of cases) {
+        const key = protocol === "responses" ? "input" : "messages";
+        const old = { model: "plain", [key]: [...A, ...B], ...extras };
+        const current = { ...old, [key]: [...A, ...C] };
+        const s = session();
+        await prime(s, old, { protocol });
+        await warm(s, current, { protocol });
+        assert(logs.at(-1)?.includes(`reason=${reason}`));
+    }
+    assert.equal(requests.length, 0);
+});
+
+for (const tool of [{ type: "code_interpreter", container: { type: "auto" } }, { type: "file_search", vector_store_ids: ["vs_synthetic"] }, { type: "image_generation" }, { type: "unknown", vendor_option: { keep: true } }, { type: "web_search_future" }]) {
+    test(`nested ${tool.type} warms with calls disabled and leaves formal request unchanged`, async () => {
+        for (const tool_choice of [undefined, "auto", "required", "none", { type: "none" }, { type: "unknown" }]) {
+            const tools = [toolNamespace([namespaceLeafCustom, { type: "web_search" }, toolNamespace([tool], "nested")])];
+            const [old, current] = namespacedBodies(tools);
+            if (tool_choice !== undefined) old.tool_choice = current.tool_choice = tool_choice;
+            const original = JSON.stringify(current);
+            const s = session();
+            const start = requests.length;
+            await prime(s, old, { protocol: "responses" });
+            response = { status: "completed", output: [{ type: "custom_tool_call", name: "exec", call_id: "never-run", input: "DO NOT EXECUTE" }] };
+            await warm(s, current, { protocol: "responses" });
+            assert.equal(requests.length, start + 1);
+            assert.equal(JSON.stringify(requests[start].body.tools), JSON.stringify(tools));
+            assert.deepEqual(requests[start].body, { ...current, input: A, max_output_tokens: 16, store: false, tool_choice: "none" });
+            assert.equal(JSON.stringify(current), original);
+            const main = await fetch(url, { method: "POST", body: JSON.stringify(current) });
+            await main.text();
+            await beforeCachePrefixRefresh(input(s, current, { protocol: "responses" }));
+            assert.equal(requests.length, start + 2, "exactly warm then normal; returned calls never execute or retry");
+            assert.deepEqual(requests[start + 1].body, current);
+        }
+    });
+}
+
+
+test("allowing native search declarations does not reinterpret historical server-tool blocks", () => {
+    for (const protocol of ["anthropic", "responses"] as const) {
+        const key = protocol === "responses" ? "input" : "messages";
+        const history = protocol === "responses" ? { type: "web_search_call", status: "completed", action: { type: "search", query: "old query" } }
+            : { role: "assistant", content: [{ type: "server_tool_use", id: "srvtoolu_old", name: "web_search", input: { query: "old query" } }] };
+        const previous = { [key]: [...A, history, ...B] };
+        const current = { [key]: [...A, history, ...C] };
+        const plan = buildPrefixRefreshBody(previous, current, protocol);
+        assert(plan.body);
+        assert.deepEqual(JSON.parse(plan.body)[key], A);
+    }
+});
+
+for (const statusCode of [400, 429, 503]) test(`native search warm HTTP ${statusCode} is attempted once, then main continues`, async () => {
+    const [old, current] = namespacedBodies([toolNamespace([{ type: "web_search" }])]);
+    const s = session();
+    await prime(s, old, { protocol: "responses" });
+    status = statusCode;
+    await warm(s, current, { protocol: "responses" });
+    assert.equal(requests.length, 1);
+    assert(logs.some(x => x.includes(`failed status=${statusCode}`) && x.includes("retry=0")));
+    status = 200;
+    const main = await fetch(url, { method: "POST", body: JSON.stringify(current) });
+    assert.equal(main.status, 200);
+    await main.text();
+    assert.equal(requests.length, 2);
+});
+
+
+for (const nested of [false, true]) test(`Responses remote MCP/connector nested=${nested} warms with calls off and exact declarations`, async () => {
+    for (const tool of [
+        { type: "mcp", server_label: "remote", server_url: "https://not-called.invalid", authorization: "synthetic-not-a-secret", require_approval: "always", allowed_tools: ["read_item"] },
+        { type: "mcp", server_label: "connected", connector_id: "connector_synthetic", require_approval: "always" },
+        { type: "connector", name: "remote" },
+        { type: "unknown", server_url: "https://not-called.invalid" },
+        { type: "unknown", connector_id: "connector_synthetic" },
+        { type: "web_search", server_url: "https://not-called.invalid" },
+    ]) for (const tool_choice of [undefined, "auto", "none", { type: "none" }, { type: "mcp", server_label: "remote", name: "read_item" }]) {
+        const tools = nested ? [toolNamespace([namespaceLeafFunction, toolNamespace([tool], "nested")])] : [tool];
+        const [old, current] = namespacedBodies(tools);
+        if (tool_choice !== undefined) old.tool_choice = current.tool_choice = tool_choice;
+        const original = JSON.stringify(current);
+        const s = session();
+        const start = requests.length;
+        await prime(s, old, { protocol: "responses" });
+        response = { status: "completed", output: [{ type: "mcp_list_tools", server_label: "remote", tools: [] }] };
+        await warm(s, current, { protocol: "responses" });
+        await beforeCachePrefixRefresh(input(s, current, { protocol: "responses" }));
+        assert.equal(requests.length, start + 1, "one mock warm only; bili does not contact or execute remote tools");
+        assert.equal(JSON.stringify(requests[start].body.tools), JSON.stringify(tools));
+        assert.deepEqual(requests[start].body, { ...current, input: A, max_output_tokens: 16, store: false, tool_choice: "none" });
+        assert.equal(JSON.stringify(current), original);
+        assert(logs.at(-1)?.includes("retry=0"));
+        assert(!logs.some(x => x.includes("synthetic-not-a-secret") || x.includes("not-called.invalid")));
     }
 });
