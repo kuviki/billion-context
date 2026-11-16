@@ -29,6 +29,8 @@
 
 **闸门与恢复。** `preflight.ts`（hold 宽限、死路冷却）、`reasoning-guard`（签名载荷永不进折叠输入）、`request-body-budget`（收/解/发字节预算，可用性大于性能 #3128）、`content-encoding`（解压炸弹守卫，413）。错误形态：`stream-error`（最小 SSE 错误+收尾）、`fake-completion`（可选重试提示）、`degenerate-turn` / `degenerate-retry`、`exit-matrix`（wire 出口 × 关注点，#588）。
 
+**可选压缩后刷新。** `src/cache-prefix-refresh.ts` 观察已提交压缩与最终受支持的 HTTP 请求。开启 `cacheKeepalive.refreshAfterCompress` 后，正式折叠请求前只发送一次未变化且合法的前缀，Anthropic/Chat 输出上限 1 token（普通 Responses 为 16）。该直连旁路请求不进入压缩循环、历史、工具执行器或主用量账本；不支持的形状与失败不影响正常转发。
+
 ## 关键入口
 
 `src/server/handle.ts`（分诊） · `src/server/prepare-*.ts`（按 wire 请求准备） · `src/marker/`（入站剥标签） · `src/loop/`（统一核心+适配器） · `src/server/stream-*.ts`（按 wire 出站） · `src/egress-transforms.ts`（用户出站体改写插件，#6003） · `src/server/preflight.ts` · `src/server/exit-matrix.ts`

@@ -1,3 +1,4 @@
+import { noteCompressionForPrefixRefresh } from "./cache-prefix-refresh.js";
 import { createHash, randomBytes } from "node:crypto";
 import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, formatTagTime, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CompressionBlock, type CompressibleRange, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
 import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
@@ -1510,6 +1511,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // refused or no-op compress rewrites no history, so it is not a
         // boundary — arming on it let the next save run the alignment (and
         // its time-attribute mark raise) on a call that folded nothing.
+        noteCompressionForPrefixRefresh(ctx.session);
         ctx.session.pendingLedgerAlign = true;
         clearCompressFailures(ctx.session);
         clearCompressLoopStreak(ctx.session);

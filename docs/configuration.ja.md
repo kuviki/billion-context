@@ -129,6 +129,7 @@
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | Authorization スキームでキーイングされた再署名アーム：署名済みモデルリクエストは、すべてのエグレスボディが再署名されてトンネリングされる；署名解除できないリクエストは、パススルーがそのスキームを逐語転送にオプトインしていない限り、ローカルで 403 として拒否される。 |
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | disabled | ACP_PROMPT_CACHE_ROUTING | bili 自身の `prompt_cache_key` 出力の姿勢（両方のワイヤ）；クライアントが供給したキーは常に逐語的に転送される。 |
 | `cacheKeepalive.enabled` | boolean | false | BILI_CACHE_KEEPALIVE | Anthropic ワイヤにおけるアイドル時のプロンプトキャッシュキープアライブのマスタースイッチ（#3376）：セッションがアイドルになると、bili は TTL 由来の周期で `max_tokens=1` を伴う最後の転送ボディを再生し、アップストリームのプレフィックスキャッシュをウォームに保つ；ヒットは `usage.cache_read_input_tokens` 経由で検証される；ミス/429/エラー連続/期間上限で停止。プロバイダルートごとおよびモデルごとにも設定可能。 |
+| `cacheKeepalive.refreshAfterCompress` | boolean | false | — | 圧縮後最初のリクエスト前に、不変で有効なプレフィックスを一度送信。Anthropic/Chat の出力上限は1トークン、通常の Responses は16。アイドル enabled とは独立。モデル > プロバイダ > 全体。未対応形式はスキップし、失敗しても再試行せず本来のリクエストを続行。追加料金が発生する場合がある。 |
 | `cacheKeepalive.ttlFactor` | number | 0.9 | BILI_CACHE_KEEPALIVE_TTL_FACTOR | 検出/推定されたキャッシュ TTL ティアに適用される周期係数（ピン間隔 = ティア x 係数；0.9 は 5 分ティアで約 4.5 分ごとに 1 ピン、1 時間ティアで 54 分ごとに 1 ピン）。(0, 1] の範囲でなければならない。 |
 | `cacheKeepalive.maxDurationMs` | number | 86400000 | BILI_CACHE_KEEPALIVE_MAX_DURATION_MS | セッションごとのキープアライブ生存期間上限、セッションの最後の実際のリクエストから測定（デフォルト 24 h）；これを過ぎると、ヒットが続いていてもキープアライブは解除される。 |
 | `cacheKeepalive.maxConcurrentPings` | number | 4 | BILI_CACHE_KEEPALIVE_MAX_PINGS | 同時にアームされたセッションの上限；超過した場合、最も長くアイドル状態のアーム済みセッションが最初に追い出される。 |
@@ -743,7 +744,7 @@
 
 ### `cacheKeepalive`
 
-- **Type:** `{ enabled?: boolean, ttlFactor?: number, maxDurationMs?: number, maxConcurrentPings?: number, assumeTtl?: "5m" | "1h", armWithoutBreakpoints?: boolean, intervalMs?: number }`
+- **Type:** `{ enabled?: boolean, refreshAfterCompress?: boolean, ttlFactor?: number, maxDurationMs?: number, maxConcurrentPings?: number, assumeTtl?: "5m" | "1h", armWithoutBreakpoints?: boolean, intervalMs?: number }`
 - **Default:** `{}` (機能オフ)
 - **Status:** ACTIVE (#3376)
 - **Description:** Anthropic ワイヤー向けのアイドル期間中のプロンプトキャッシュキープアライブ (#3376)。Anthropic のプレフィックスキャッシュは TTL (ブレークポイントごとに 5 分または 1 時間) で期限切れになる; セッションがアイドル状態 (昼休み、一晩中) の間、次の実際のリクエストは、キャッシュされたプレフィックスのフルプライスのコールドリビルドを支払うことになる。有効化されると、bili は各セッションの最後に正常に転送されたリクエスト本体のスナップショットを撮る — アップストリームに到達した正確なバイト列、`cache_control` ブレークポイントを含む — そして、セッションがアイドル状態の間、TTL 由来の周期で `max_tokens=1` を付けて再生する; キャッシュヒット応答は、最小限の 1 回の完了のコストで TTL を更新する。すべてのピンは、アップストリーム自身の `usage.cache_read_input_tokens` に対して検証される: ヒットすると次のピンを再スケジュールする; 読み取りトークンがゼロの場合、プレフィックスはすでに死んでいることを意味し、キープアライブは停止する。

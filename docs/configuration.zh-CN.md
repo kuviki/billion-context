@@ -132,6 +132,7 @@
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (armed; built-in scheme sdk-hmac-sha256) | BILI_RESIGN, BILI_RESIGN_PASSTHROUGH, BILI_CODEARTS_REF, BILI_RESIGN_BENEFIT | 按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。 |
 | `promptCache.routing` | "auto" \| "enabled" \| "disabled" | disabled | ACP_PROMPT_CACHE_ROUTING | bili 自注入 `prompt_cache_key` 的姿态（两条 wire 同时生效）；客户端自带的 key 永远原样转发。 |
 | `cacheKeepalive.enabled` | boolean | false | BILI_CACHE_KEEPALIVE | Anthropic 线路空闲期提示缓存保活总开关（#3376）：会话空闲时按 TTL 推导的节奏以 max_tokens=1 重放最后一次转发的请求体，维持上游前缀缓存温热；以 usage.cache_read_input_tokens 验证命中，miss/429/连续错误/时长上限即停；支持逐 provider 路由与逐模型覆盖。 |
+| `cacheKeepalive.refreshAfterCompress` | boolean | false | — | 压缩后首次请求前，单独请求一次未变化且协议合法的前缀。Anthropic/Chat 输出上限 1 token，普通 Responses 为 16。独立于空闲保活 enabled；模型 > provider > 全局。不支持的形状跳过，失败不重试并继续正式请求；额外用量可能计费。 |
 | `cacheKeepalive.ttlFactor` | number | 0.9 | BILI_CACHE_KEEPALIVE_TTL_FACTOR | 作用于检测/假定缓存 TTL 档位的节奏因子（ping 间隔 = 档位 x 因子；0.9 → 5 分钟档约每 4.5 分钟、1 小时档约每 54 分钟一次）。取值须在 (0, 1]。 |
 | `cacheKeepalive.maxDurationMs` | number | 86400000 | BILI_CACHE_KEEPALIVE_MAX_DURATION_MS | 单会话保活时长上限，自其最后一次真实请求起算（默认 24 小时）；超过后即使仍在命中也会解除武装。 |
 | `cacheKeepalive.maxConcurrentPings` | number | 4 | BILI_CACHE_KEEPALIVE_MAX_PINGS | 同时武装的会话数上限；超限时先驱逐空闲最久的已武装会话。 |
@@ -739,7 +740,7 @@
 
 ### `cacheKeepalive`
 
-- **类型：** `{ enabled?: boolean, ttlFactor?: number, maxDurationMs?: number, maxConcurrentPings?: number, assumeTtl?: "5m" | "1h", armWithoutBreakpoints?: boolean, intervalMs?: number }`
+- **类型：** `{ enabled?: boolean, refreshAfterCompress?: boolean, ttlFactor?: number, maxDurationMs?: number, maxConcurrentPings?: number, assumeTtl?: "5m" | "1h", armWithoutBreakpoints?: boolean, intervalMs?: number }`
 - **默认值：** `{}`（功能关闭）
 - **状态：** ACTIVE（#3376）
 - **说明：** Anthropic 线路的空闲期提示缓存保活（#3376）。Anthropic 前缀缓存按 TTL 过期（每个断点 5 分钟或 1 小时）；会话空闲期间（午休、过夜）缓存失效，下一个真实请求就要为整个已缓存前缀付全价冷重建。启用后，bili 对每个会话快照其最后一次成功转发的请求体——到达上游的精确字节，含其中的 `cache_control` 断点——并在会话保持空闲时以 `max_tokens=1` 按 TTL 推导的节奏重放；命中缓存的响应只需一次最小补全即可刷新 TTL。每次 ping 以上游返回的 `usage.cache_read_input_tokens` 验证：命中则排定下一次；读数为 0 说明前缀已死，立即停止。
@@ -748,6 +749,8 @@
   - **停止条件。** 该会话出现真实请求立即取消（真实请求自己就会刷新缓存）；到点时该会话有在途请求则延迟约 5 秒再试；`cache_read_input_tokens = 0` → 停（`prefix-dead`）；HTTP 429 → 立即停；连续 3 次其他错误 → 停；距该会话最后一次真实请求超过 `maxDurationMs`（默认 24 小时）→ 停；`maxConcurrentPings`（默认 4）限制同时武装的会话数，超限时先驱逐空闲最久者。
   - **成本与可观测性。** ping 完全绕过代理管线，因此不会进入 `/acp-cache` 命中率台账（合成流量不得污染健康判定），也不会产生任何缓存归因样本——miss 归因计算跑的请求序列与不开保活时完全一致。每次武装/ping/解除武装都记录 `[keepalive] …` 日志行；`acp_status` 对已武装会话输出一行 `CACHE KEEPALIVE: armed tier=… cadence=… · pings=N [· last-hit Mm ago]`（未武装时不出现）；Web UI 在会话列表显示保活徽标、详情页显示完整状态行，其原始 JSON 配置编辑器可直接写入本配置节（保存时服务端校验）。
   - **逐 provider / 逐模型覆盖。** 所有字段也可写在 provider 路由下（`providers.<url>.cacheKeepalive`），或写在该路由的某个具体模型下（`providers.<url>.models.<model>.cacheKeepalive`）——同一上游后的不同模型可以跑不同的档位/节奏。逐字段优先级：环境变量 > 模型 > 路由 > 全局块 > 内置默认值。
+
+  - **压缩后刷新（独立开关）。** `refreshAfterCompress: true` 在首次真正体现压缩结果的请求前，单独请求一次未变化且协议合法的前缀。独立于 `enabled`，没有环境变量覆盖，优先级为模型 > provider 路由 > 全局 > `false`。刷新沿用相同路由、模型、凭据，设 `stream=false`。Anthropic 和 Chat 输出上限为 `max_tokens=1`（原 Chat 请求使用 `max_completion_tokens` 时设该字段为 `1`），普通 Responses 设 `max_output_tokens=16`。丢弃输出，不执行工具或写入历史。仅做一次短超时尝试，失败后继续正式请求，不重试。支持完整 JSON Anthropic、OpenAI Chat 及普通 Responses HTTP；启用 thinking/reasoning、Codex OAuth `backend-api`、threads/conversation/`previous_response_id`、托管或服务端工具、非文本输出或音频生成、顶层 `web_search_options`/`plugins`/`context_management`、幂等键、重签名、不透明变换和自定义传输的请求跳过。没有合法公共前缀或旧快照也跳过。原生 Claude 提示缓存可能需要显式断点；本功能刻意既不添加也不要求 `cache_control`，让不支持显式断点的供应商使用自身的自动缓存匹配。日志记录成功、失败或跳过、耗时和状态，以及可获取的缓存 token、标准化输入总数与命中比例（缺失时为 `unknown`）。额外输入、缓存及输出用量可能计费，成功不保证供应商随后命中缓存。示例：`"cacheKeepalive": { "enabled": false, "refreshAfterCompress": true }`。
 
 ### `autoUpdate`
 

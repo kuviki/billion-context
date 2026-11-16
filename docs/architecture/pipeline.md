@@ -29,6 +29,8 @@ Every model-traffic request that reaches the proxy passes through this module: i
 
 **Gates & recovery.** `preflight.ts` (hold grace, dead-end cooldown), `reasoning-guard` (signed payloads are never fold inputs), `request-body-budget` (receive/decode/send byte caps, availability over performance #3128), `content-encoding` (decompression-bomb guard, 413). Error shapes: `stream-error` (minimal SSE error + finish), `fake-completion` (opt-in retry hint), `degenerate-turn` / `degenerate-retry`, and `exit-matrix` (wire-exit × concerns, #588).
 
+**Optional post-fold refresh.** `src/cache-prefix-refresh.ts` observes a committed fold and the final supported HTTP wire. When `cacheKeepalive.refreshAfterCompress` is enabled, it sends the unchanged legal prefix once before the real folded request, with a 1-token Anthropic/Chat output cap (16 for plain Responses). This direct side request never enters the compression loop, history, tool executor or primary usage ledger; unsupported shapes and failures leave normal forwarding intact.
+
 ## Key entries
 
 `src/server/handle.ts` (triage) · `src/server/prepare-*.ts` (per-wire request prep) · `src/marker/` (inbound tag strip) · `src/loop/` (unified core + adapters) · `src/server/stream-*.ts` (per-wire egress) · `src/egress-transforms.ts` (user egress body-rewrite plugins, #6003) · `src/server/preflight.ts` · `src/server/exit-matrix.ts`

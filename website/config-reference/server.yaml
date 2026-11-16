@@ -478,6 +478,13 @@ entries:
     desc_en: "Master switch for idle prompt-cache keepalive on the Anthropic wire (#3376): while a session goes idle, bili replays the last forwarded body with max_tokens=1 on a TTL-derived cadence so the upstream prefix cache stays warm; hits are verified via usage.cache_read_input_tokens; stops on miss/429/error-streak/duration cap. Also settable per provider route and per model."
     desc_zh: "Anthropic 线路空闲期提示缓存保活总开关（#3376）：会话空闲时按 TTL 推导的节奏以 max_tokens=1 重放最后一次转发的请求体，维持上游前缀缓存温热；以 usage.cache_read_input_tokens 验证命中，miss/429/连续错误/时长上限即停；支持逐 provider 路由与逐模型覆盖。"
     desc_ja: "Anthropic ワイヤにおけるアイドル時のプロンプトキャッシュキープアライブのマスタースイッチ（#3376）：セッションがアイドルになると、bili は TTL 由来の周期で `max_tokens=1` を伴う最後の転送ボディを再生し、アップストリームのプレフィックスキャッシュをウォームに保つ；ヒットは `usage.cache_read_input_tokens` 経由で検証される；ミス/429/エラー連続/期間上限で停止。プロバイダルートごとおよびモデルごとにも設定可能。"
+  - key: cacheKeepalive.refreshAfterCompress
+    type: boolean
+    default: "false"
+    group: behavior
+    desc_en: "Send one unchanged legal prefix before the first post-compression request. Anthropic/Chat cap output at 1 token; plain Responses at 16. Independent of idle enabled; model > provider > global. Unsupported shapes skip; failures continue the real request without retry. Extra usage may be billed."
+    desc_zh: "压缩后首次请求前，单独请求一次未变化且协议合法的前缀。Anthropic/Chat 输出上限 1 token，普通 Responses 为 16。独立于空闲保活 enabled；模型 > provider > 全局。不支持的形状跳过，失败不重试并继续正式请求；额外用量可能计费。"
+    desc_ja: "圧縮後最初のリクエスト前に、不変で有効なプレフィックスを一度送信。Anthropic/Chat の出力上限は1トークン、通常の Responses は16。アイドル enabled とは独立。モデル > プロバイダ > 全体。未対応形式はスキップし、失敗しても再試行せず本来のリクエストを続行。追加料金が発生する場合がある。"
   - key: cacheKeepalive.ttlFactor
     type: number
     default: "0.9"

@@ -88,6 +88,14 @@ function modelTierPresent(routes: ProviderRoutes | undefined, upstreamUrl: strin
     return Object.values(models).some((e) => e !== null && typeof e === "object" && "cacheKeepalive" in e);
 }
 
+export function resolveCacheRefreshAfterCompress(routes: ProviderRoutes | undefined, upstreamUrl: string | undefined, model?: string): boolean {
+    const route = routes ? findRoute(routes, upstreamUrl) : undefined;
+    const modelValue = resolveModelEntryOnRoute(route, model).entry?.cacheKeepalive?.refreshAfterCompress;
+    const providerValue = route?.cacheKeepalive?.refreshAfterCompress;
+    const globalValue = loadConfigFile().cacheKeepalive?.refreshAfterCompress;
+    return (modelValue ?? providerValue ?? globalValue) === true;
+}
+
 export function resolveCacheKeepalive(routes: ProviderRoutes | undefined, upstreamUrl: string | undefined, model?: string): ResolvedKeepalive {
     const g: CacheKeepaliveSettings = loadConfigFile().cacheKeepalive ?? {};
     const route = routes ? findRoute(routes, upstreamUrl) : undefined;

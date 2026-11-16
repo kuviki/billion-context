@@ -255,6 +255,7 @@ billion-context/
 │   ├── attach-heartbeat.ts       # Silence alarm for a hot-at-attach session with zero observed requests (#5408)
 │   ├── auto-mode-forge.ts        # Local forged verdicts for the Claude Code auto-mode safety classifier (#2740)
 │   ├── cache-keepalive.ts        # Idle prompt-cache TTL keepalive pings replaying the last egress body (#3376)
+│   ├── cache-prefix-refresh.ts  # Opt-in one-shot unchanged-prefix warming after a committed fold, before final egress
 │   ├── claude-mcp-entry.ts       # Per-session Claude native MCP server + mid-session proxy watchdog (#1821)
 │   ├── claude-transcript-lineage.ts # Resume lineage from Claude Code transcript forkedFrom markers (#1486)
 │   ├── client-ua-registry.ts     # Bounded in-memory registry of recently observed client user-agents (#4649)

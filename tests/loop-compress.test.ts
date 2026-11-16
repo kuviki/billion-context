@@ -699,3 +699,58 @@ test("loop #422c: refreshFolded throws → re-request keeps the pre-compress vie
         probe.restore();
     }
 });
+
+// The real applyRanges commit hook arms refresh; the loop must warm after its
+// final adapter build and before sending the compressed continuation.
+test("prefix refresh: real compress commit warms unchanged prefix before loop re-request", async () => {
+    const { beforeCachePrefixRefresh, _resetPrefixRefreshForTest } = await import("../src/cache-prefix-refresh.ts");
+    _resetPrefixRefreshForTest();
+    const ctx = {
+        ...withRefs(makeCtx([
+            textMsg("raw_prefix", "user", "UNCHANGED-PREFIX"),
+            textMsg("raw_2", "user", "OLD-COMPRESSIBLE-B " + bigText(5000)),
+            textMsg("raw_3", "user", "OLD-COMPRESSIBLE-B " + bigText(5000)),
+            textMsg("raw_4", "assistant", bigText(5000)),
+            textMsg("raw_5", "user", bigText(5000)),
+            textMsg("raw_6", "assistant", bigText(5000)),
+            textMsg("raw_7", "user", bigText(5000)),
+            textMsg("raw_8", "assistant", bigText(5000)),
+        ])),
+        protocol: "responses" as const,
+    };
+    const request = { model: "plain-model", input: [], stream: true };
+    const adapter = createResponsesAdapter();
+    const previous = adapter.buildRequest(ctx.messages, SYS_PROMPT, request);
+    (await beforeCachePrefixRefresh({ session: ctx.session, enabled: true, protocol: "responses", body: JSON.stringify(previous), url: "http://mock", headers: {} }))();
+    ctx.refreshFolded = (current) => [
+        ctx.messages[0],
+        textMsg("fresh_summary", "user", "FOLDED-C"),
+        ...ctx.messages.slice(3),
+        ...current.filter(m => m.id.startsWith("acp_loop_")),
+    ];
+    const args = JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: "The completed source reads were compressed into this durable summary; remaining task instructions are retained." }] });
+    const initial = [sse("response.created", { response: { id: "resp_initial", status: "in_progress" } }), fcEvents(0, "compress_refresh", "compress", args), COMPLETED].join("");
+    const sent: Record<string, unknown>[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url, options) => {
+        const outgoing = JSON.parse(String(options?.body)) as Record<string, unknown>;
+        sent.push(outgoing);
+        return outgoing.stream === false
+            ? new Response(JSON.stringify({ usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 100 } } }), { status: 200 })
+            : new Response(REFETCH_DONE, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        for await (const _chunk of runCompressLoop(new Response(initial).body!, ctx, request, { url: "http://mock", headers: {}, refreshAfterCompress: true }, adapter, SYS_PROMPT)) { /* drain */ }
+        assert(ctx.session.state.blocks.length > 0, "real compression committed");
+        assert.equal(sent.length, 2, "one warm then one normal continuation");
+        assert.equal(sent[0].stream, false);
+        assert.equal(sent[0].max_output_tokens, 16);
+        assert.match(JSON.stringify(sent[0]), /UNCHANGED-PREFIX/);
+        assert.doesNotMatch(JSON.stringify(sent[0]), /OLD-COMPRESSIBLE-B|FOLDED-C/);
+        assert.equal(sent[1].stream, true);
+        assert.match(JSON.stringify(sent[1]), /FOLDED-C/);
+    } finally {
+        globalThis.fetch = originalFetch;
+        _resetPrefixRefreshForTest();
+    }
+});

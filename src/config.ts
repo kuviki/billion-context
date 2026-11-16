@@ -154,13 +154,14 @@ export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream UR
  *  upstream prefix cache survives user pauses. Verdict per ping:
  *  usage.cache_read_input_tokens > 0 → reschedule; 0 → stop (prefix dead);
  *  HTTP 429 → immediate stop; ≥3 consecutive other failures → stop.
- *  Configurable at two levels — global (config root `cacheKeepalive`) and
- *  per-provider (`providers[url].cacheKeepalive`) — merged per-field
- *  provider-wins by resolveCacheKeepalive (src/cache-keepalive.ts); env BILI_
- *  CACHE_KEEPALIVE* wins over both. All fields optional; unset = default. */
+ *  Configurable globally, per provider and per model; deepest wins per field.
+ *  Existing BILI_CACHE_KEEPALIVE* env overrides apply to idle settings only.
+ *  refreshAfterCompress is a separate default-off, config-only opt-in. */
 export interface CacheKeepaliveSettings {
-    /** Master switch. Default false (opt-in feature). */
+    /** Idle timer switch. Default false (opt-in feature). */
     enabled?: boolean;
+    /** One prefix-only request before the first post-compression send. Default false; independent of the idle timer. */
+    refreshAfterCompress?: boolean;
     /** Cadence factor applied to the TTL tier (default 0.9 → 5m tier pings
      *  every ~4.5 min, 1h tier every ~54 min). Must be in (0, 1]. */
     ttlFactor?: number;
@@ -3180,7 +3181,7 @@ export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; ma
 // THROWS (config-load failure) instead of being silently dropped, so a
 // typo'd keepalive config can't leave the user wondering why idle sessions
 // cold-rebuild every time.
-const CACHE_KEEPALIVE_FIELDS = ["enabled", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
+const CACHE_KEEPALIVE_FIELDS = ["enabled", "refreshAfterCompress", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
 
 export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings | undefined {
     if (v === undefined) return undefined;
@@ -3192,10 +3193,12 @@ export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings 
             throw new Error(`[acp-config] cacheKeepalive has unknown key "${key}" (allowed: ${CACHE_KEEPALIVE_FIELDS.join(", ")})`);
     }
     const out: CacheKeepaliveSettings = {};
-    if ("enabled" in obj) {
-        if (typeof obj.enabled !== "boolean")
-            throw new Error(`[acp-config] cacheKeepalive.enabled must be a boolean (got ${JSON.stringify(obj.enabled)})`);
-        out.enabled = obj.enabled;
+    for (const key of ["enabled", "refreshAfterCompress"] as const) {
+        if (key in obj) {
+            if (typeof obj[key] !== "boolean")
+                throw new Error(`[acp-config] cacheKeepalive.${key} must be a boolean (got ${JSON.stringify(obj[key])})`);
+            out[key] = obj[key];
+        }
     }
     if ("ttlFactor" in obj) {
         const n = obj.ttlFactor;

@@ -1,3 +1,4 @@
+import { beforeCachePrefixRefresh } from "../cache-prefix-refresh.js";
 import {
     hideConsumedCompressCalls,
     type CompressionCore,
@@ -288,6 +289,8 @@ export interface LoopCtx {
 }
 
 export interface RequestOptions {
+    refreshAfterCompress?: boolean;
+    prefixRefreshUnsupported?: boolean;
     url: string;
     /** Exact request model when this wire carries it in a URL/envelope instead of the body. */
     model?: string;
@@ -681,6 +684,12 @@ export async function* runCompressLoop(
         // (the loop's own round budget already bounds amplification; arming the
         // hold from loop verdicts lets the relay's pre-forward gate protect the
         // NEXT client turn without changing loop behavior mid-flight).
+        const acceptPrefixSnapshot = await beforeCachePrefixRefresh({
+            session: ctx.session, enabled: requestOptions.refreshAfterCompress === true,
+            protocol: ctx.protocol, body: wireBodyStr, url: requestOptions.url,
+            headers: requestOptions.headers, dispatcher: ctx.proxyUrl ? proxyDispatcher(ctx.proxyUrl) : undefined,
+            signal, unsupported: requestOptions.prefixRefreshUnsupported,
+        });
         const throttledSend = fetchWithRetry(
             requestOptions.url,
             {
@@ -710,6 +719,7 @@ export async function* runCompressLoop(
         // (retry-after is not carried on the error) before rethrowing.
         try {
             const upstreamSend = await throttledSend;
+            acceptPrefixSnapshot();
             noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, upstreamSend.response.status, Date.now(), requestModel);
             return upstreamSend;
         } catch (error) {
