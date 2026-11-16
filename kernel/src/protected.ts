@@ -767,13 +767,30 @@ export function isPlainTextSystemMessage(raw: unknown): boolean {
 /** #4166: plain-text responses system/developer item — content is a
  *  string or an all-text parts array (input_text/output_text), so its bytes
  *  live entirely in `text` and folding loses nothing structural. */
-function isPlainTextResponsesSystemItem(raw: unknown): boolean {
+export function isPlainTextResponsesSystemItem(raw: unknown): boolean {
   const m = asObj(raw);
   if (
     !m ||
     Object.keys(m).some(
-      (k) => k !== "type" && k !== "role" && k !== "content",
-    )
+      (k) =>
+        k !== "type" &&
+        k !== "role" &&
+        k !== "content" &&
+        k !== "id" &&
+        k !== "internal_chat_message_metadata_passthrough",
+    ) ||
+    ("id" in m && typeof m.id !== "string") ||
+    ("internal_chat_message_metadata_passthrough" in m &&
+      !isPlainResponsesAttribution(
+        m.internal_chat_message_metadata_passthrough,
+        m.content,
+      ))
+  )
+    return false;
+  if (
+    ("id" in m || "internal_chat_message_metadata_passthrough" in m) &&
+    ((m.type !== undefined && m.type !== "message") ||
+      (m.role !== "system" && m.role !== "developer"))
   )
     return false;
   if (typeof m.content === "string") return true;
@@ -789,6 +806,64 @@ function isPlainTextResponsesSystemItem(raw: unknown): boolean {
         Object.keys(o).every((k) => k === "type" || k === "text")
       );
     })
+  );
+}
+
+/** #6949: Codex's documented attribution subset, not arbitrary passthrough
+ * state. Tool bookkeeping, hooks, unknown fields and other provenance stay
+ * protected. Positional vectors require ONE text part: text rewrites merge
+ * parts, so accepting several would misattribute their content afterward.
+ * Source: openai/codex codex-rs/protocol/src/models{,/item_metadata}.rs. */
+function isPlainResponsesAttribution(raw: unknown, content: unknown): boolean {
+  const m = asObj(raw);
+  if (
+    !m ||
+    Array.isArray(raw) ||
+    Object.keys(m).some(
+      (k) =>
+        k !== "turn_id" &&
+        k !== "create_time" &&
+        k !== "content_item_kinds" &&
+        k !== "content_item_metadata",
+    )
+  )
+    return false;
+  if ("turn_id" in m && typeof m.turn_id !== "string") return false;
+  if (
+    "create_time" in m &&
+    (typeof m.create_time !== "number" || !Number.isFinite(m.create_time))
+  )
+    return false;
+  if (!("content_item_kinds" in m) && !("content_item_metadata" in m))
+    return true;
+  if (!Array.isArray(content) || content.length !== 1) return false;
+  if (
+    "content_item_kinds" in m &&
+    (!Array.isArray(m.content_item_kinds) ||
+      m.content_item_kinds.length !== 1 ||
+      typeof m.content_item_kinds[0] !== "string")
+  )
+    return false;
+  if (!("content_item_metadata" in m)) return true;
+  if (
+    !Array.isArray(m.content_item_metadata) ||
+    m.content_item_metadata.length !== 1
+  )
+    return false;
+  const entry = asObj(m.content_item_metadata[0]);
+  if (
+    !entry ||
+    Array.isArray(entry) ||
+    Object.keys(entry).some((k) => k !== "provenance")
+  )
+    return false;
+  const provenance = asObj(entry.provenance);
+  return (
+    !!provenance &&
+    !Array.isArray(provenance) &&
+    provenance.type === "harness" &&
+    Object.keys(provenance).every((k) => k === "type" || k === "hook") &&
+    (!("hook" in provenance) || provenance.hook === false)
   );
 }
 
