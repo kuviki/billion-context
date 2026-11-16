@@ -13,7 +13,6 @@ type Json = Record<string, unknown>;
 type Snapshot = { body: Json; namespace: string; order: number; skipReason?: string };
 type RefreshState = { last?: Snapshot; pending?: Snapshot; active?: Promise<void>; order: number };
 let states = new WeakMap<Session, RefreshState>();
-const promptFields = ["model", "system", "instructions", "tools", "functions", "tool_choice", "function_call", "parallel_tool_calls", "web_search_options", "response_format", "text", "prompt", "prompt_cache_key", "prompt_cache_retention", "thinking", "reasoning", "reasoning_effort", "enable_thinking", "chat_template_kwargs", "cache_control", "context_management", "user", "safety_identifier"];
 const obj = (v: unknown): v is Json => v !== null && typeof v === "object" && !Array.isArray(v);
 const equal = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 
@@ -114,9 +113,8 @@ function parseSnapshot(inp: PrefixRefreshInput): { snapshot?: Snapshot; reason?:
     let body: unknown;
     try { body = JSON.parse(inp.body.toString()); } catch { return { reason: "non-json-wire-body" }; }
     if (!obj(body)) return { reason: "non-object-wire-body" };
-    const stable = Object.fromEntries(promptFields.filter(k => body[k] !== undefined).map(k => [k, body[k]]));
-    const providerHeaders = Object.entries(inp.headers).filter(([k]) => /^(anthropic-version|anthropic-beta|openai-organization|openai-project)$/i.test(k)).map(([k, v]) => [k.toLowerCase(), v]).sort();
-    const namespace = createHash("sha256").update(JSON.stringify([inp.url, inp.protocol, credentialFingerprint(inp.headers), providerHeaders, stable])).digest("hex");
+    const tenantHeaders = Object.entries(inp.headers).filter(([k]) => /^(openai-organization|openai-project)$/i.test(k)).map(([k, v]) => [k.toLowerCase(), v]).sort();
+    const namespace = createHash("sha256").update(JSON.stringify([inp.url, inp.protocol, body.model, credentialFingerprint(inp.headers), tenantHeaders])).digest("hex");
     return { snapshot: { body, namespace, order: 0, skipReason: unsupportedReason(inp, body) } };
 }
 
@@ -343,10 +341,10 @@ export async function beforeCachePrefixRefresh(inp: PrefixRefreshInput): Promise
         if (state.active) await state.active;
         const pending = state.pending;
         if (pending) {
-            const plan = pending.namespace === snapshot.namespace ? buildPrefixRefreshBody(pending.body, snapshot.body, inp.protocol!) : { unchanged: false, reason: "prompt-or-route-identity-changed" };
+            const plan = pending.namespace === snapshot.namespace ? buildPrefixRefreshBody(pending.body, snapshot.body, inp.protocol!) : { unchanged: false, reason: "cache-route-identity-changed" };
             if (!plan.unchanged) {
                 delete state.pending;
-                const reason = snapshot.skipReason ?? pending.skipReason ?? plan.reason;
+                const reason = snapshot.skipReason ?? plan.reason;
                 if (plan.body && !reason && !inp.signal?.aborted) {
                     const active = sendRefresh(inp, plan.body);
                     state.active = active;

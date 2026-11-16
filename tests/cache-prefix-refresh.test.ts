@@ -172,19 +172,21 @@ for (const failureMode of ["timeout", "disconnect"] as const) {
     });
 }
 
-test("namespace/model/credentials changes never warm the old namespace", async () => {
+test("wire/model/credential/endpoint/tenant changes never reuse the old cache route", async () => {
     for (const [value, override] of [
         [body([...A, ...C], { model: "changed-model" }), {}],
-        [body([...A, ...C], { system: "changed system" }), {}],
         [afterBody, { headers: { "x-api-key": "changed-key" } }],
         [afterBody, { url: `${url}?other-route=1` }],
+        [afterBody, { protocol: "openai" }],
+        [afterBody, { headers: { ...input(session()).headers, "OpenAI-Organization": "org-new" } }],
+        [afterBody, { headers: { ...input(session()).headers, "OpenAI-Project": "project-new" } }],
     ] as [Json, Partial<PrefixRefreshInput>][]) {
         const s = session();
         await prime(s);
         await warm(s, value, override);
     }
     assert.equal(requests.length, 0);
-    assert(logs.some(x => x.includes("[cache-prefix-refresh] skipped") && x.includes("http=not-sent")));
+    assert.equal(logs.filter(x => x.includes("reason=cache-route-identity-changed") && x.includes("http=not-sent")).length, 6);
 });
 
 test("unsupported request families skip, preserving availability", async () => {
@@ -777,12 +779,13 @@ for (const options of [{}, { search_context_size: "high", user_location: { type:
     });
 }
 
-test("Chat search settings are prompt identity, not incidental metadata", async () => {
+test("Chat search setting changes warm the current template rather than blocking", async () => {
     const s = session();
     await prime(s, body([...A, ...B], { web_search_options: { search_context_size: "low" } }), { protocol: "openai" });
     await warm(s, body([...A, ...C], { web_search_options: { search_context_size: "high" } }), { protocol: "openai" });
-    assert.equal(requests.length, 0);
-    assert(logs.some(x => x.includes("reason=prompt-or-route-identity-changed")));
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0].body.web_search_options, { search_context_size: "high" });
+    assert.deepEqual(requests[0].body.messages, A);
 });
 
 test("native search does not relax unknown top-level tools or other effect guards", async () => {
@@ -891,4 +894,91 @@ for (const nested of [false, true]) test(`Responses remote MCP/connector nested=
         assert(logs.at(-1)?.includes("retry=0"));
         assert(!logs.some(x => x.includes("synthetic-not-a-secret") || x.includes("not-called.invalid")));
     }
+});
+
+for (const protocol of ["anthropic", "openai", "responses"] as const) {
+    test(`${protocol} changed prompt/settings warm shared history using only the upcoming template`, async () => {
+        const key = protocol === "responses" ? "input" : "messages";
+        const oldSettings: Json = protocol === "anthropic"
+            ? { system: "old system", tools: [{ name: "old_tool", input_schema: { type: "object", properties: {} } }], tool_choice: { type: "auto" }, thinking: { type: "disabled" } }
+            : protocol === "responses"
+                ? { instructions: "old instructions", tools: [namespaceLeafFunction], tool_choice: "auto", reasoning: { effort: "low" }, text: { format: { type: "text" } } }
+                : { system: "old system", tools: [{ type: "function", function: { name: "old_tool", parameters: { type: "object" } } }], tool_choice: "auto", reasoning_effort: "low", response_format: { type: "text" }, web_search_options: { search_context_size: "low" } };
+        const newSettings: Json = protocol === "anthropic"
+            ? { system: [{ type: "text", text: "new system" }], tools: [{ name: "new_tool", input_schema: { type: "object", properties: { value: { type: "string" } } } }], tool_choice: { type: "auto", disable_parallel_tool_use: true }, thinking: { type: "adaptive" } }
+            : protocol === "responses"
+                ? { instructions: "new instructions", tools: [toolNamespace([namespaceLeafCustom])], tool_choice: "required", reasoning: { effort: "medium" }, text: { format: { type: "json_object" } } }
+                : { system: "new system", tools: [{ type: "function", function: { name: "new_tool", parameters: { type: "object", properties: { value: { type: "string" } } } } }], tool_choice: { type: "function", function: { name: "new_tool" } }, reasoning_effort: "medium", response_format: { type: "json_object" }, web_search_options: { search_context_size: "high" } };
+        const old: Json = { model: "plain", [key]: [...A, ...B], stream: false, max_tokens: 4000, prompt_cache_key: "old-hint", prompt_cache_retention: "in_memory", parallel_tool_calls: true, user: "old-user", safety_identifier: "old-id", ...oldSettings };
+        const current: Json = { model: "plain", [key]: [...A, ...C], stream: true, stream_options: { include_usage: false }, max_tokens: 6000, prompt_cache_key: "new-hint", prompt_cache_retention: "24h", parallel_tool_calls: false, user: "new-user", safety_identifier: "new-id", ...newSettings };
+        const original = JSON.stringify(current);
+        const s = session();
+        await prime(s, old, { protocol });
+        response = protocol === "responses" ? { status: "completed" } : protocol === "openai" ? { choices: [{ finish_reason: "stop" }] } : { stop_reason: "end_turn" };
+        await warm(s, current, { protocol });
+        assert.equal(requests.length, 1);
+        const expected: Json = { ...current, [key]: A };
+        delete expected.max_tokens;
+        if (protocol === "responses") { expected.max_output_tokens = 16; expected.store = false; }
+        else if (protocol === "openai") expected.max_completion_tokens = 1;
+        else expected.max_tokens = 1;
+        assert.deepEqual(requests[0].body, expected);
+        assert.equal(JSON.stringify(current), original);
+        assert(!logs.some(x => x.includes("cache-route-identity-changed")));
+    });
+}
+
+test("previous accepted but warm-unsupported requests are usable history, not a veto", async () => {
+    for (const previous of [
+        { extras: { system: "old system" }, headers: { "Idempotency-Key": "old-main-only" } },
+        { extras: { tools: [{ type: "web_fetch_20250910", name: "web_fetch" }], tool_choice: { type: "tool", name: "web_fetch" } }, headers: {} },
+        { extras: { thinking: { type: "enabled", budget_tokens: 1024 } }, headers: {} },
+        { extras: {}, headers: { "anthropic-beta": "message-threads-2026-01-01" } },
+    ]) {
+        const s = session();
+        const old = body([...A, ...B], previous.extras);
+        const oldHeaders = { ...input(s).headers, ...previous.headers } as Record<string, string>;
+        const start = requests.length;
+        const accepted = await beforeCachePrefixRefresh(input(s, old, { headers: oldHeaders }));
+        const oldMain = await fetch(url, { method: "POST", headers: oldHeaders, body: JSON.stringify(old) });
+        assert.equal(oldMain.status, 200);
+        await oldMain.text();
+        accepted();
+        assert.equal(requests.length, start + 1);
+        const current = body([...A, ...C], { system: "upcoming system", tools: [], tool_choice: { type: "auto" } });
+        await warm(s, current);
+        assert.equal(requests.length, start + 2, "the accepted old unsupported request must not suppress the current valid warm");
+        assert.deepEqual(requests[start + 1].body, { ...current, messages: A, max_tokens: 1 });
+        assert.equal(requests[start + 1].headers["idempotency-key"], undefined);
+        assert.equal(requests[start + 1].headers["anthropic-beta"], undefined);
+        await beforeCachePrefixRefresh(input(s, current));
+        assert.equal(requests.length, start + 2, "the same fold still warms only once");
+    }
+});
+
+test("Anthropic version and non-stateful beta changes use current headers without partitioning", async () => {
+    const s = session();
+    const oldHeaders = { ...input(s).headers, "anthropic-version": "2023-01-01", "anthropic-beta": "old-beta" };
+    const currentHeaders = { ...input(s).headers, "anthropic-version": "2023-06-01", "anthropic-beta": "interleaved-thinking-2025-05-14" };
+    await prime(s, beforeBody, { headers: oldHeaders });
+    await warm(s, afterBody, { headers: currentHeaders });
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].headers["anthropic-version"], "2023-06-01");
+    assert.equal(requests[0].headers["anthropic-beta"], "interleaved-thinking-2025-05-14");
+});
+
+test("current unsupported checks still win after prompt settings change", async () => {
+    for (const current of [
+        { extras: { tools: [{ type: "web_fetch_20250910", name: "web_fetch" }] }, override: {} },
+        { extras: { system: "new system" }, override: { headers: { ...input(session()).headers, "Idempotency-Key": "current-main-only" } } },
+        { extras: { mcp_servers: [{ url: "https://not-called.invalid" }] }, override: {} },
+    ]) {
+        const s = session();
+        await prime(s);
+        await warm(s, body([...A, ...C], current.extras), current.override);
+    }
+    assert.equal(requests.length, 0);
+    assert(logs.some(x => x.includes("reason=server-or-unknown-tools")));
+    assert(logs.some(x => x.includes("reason=main-request-idempotency-key")));
+    assert(logs.some(x => x.includes("reason=server-mcp-tools")));
 });
