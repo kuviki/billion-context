@@ -1,4 +1,5 @@
 import type { CoreMessage } from "../types.js";
+import { isPlainTextResponsesSystemItem } from "../protected.js";
 import { splitDemotedThinking } from "./demoted-thinking.js";
 import { ClusterCounter } from "./message-id.js";
 import {
@@ -945,14 +946,33 @@ export function coreToResponses(
           text !== responsesTextOf(rawMsg.content) &&
           isPlainResponsesContent(rawMsg.content)
         ) {
-          out.push({
-            type: "message",
-            role: rawMsg.role,
-            content:
-              typeof rawMsg.content === "string"
-                ? text
-                : [{ type: "input_text", text }],
-          } as ResponseInputItem);
+          // #6949: newly foldable Codex envelopes also receive ref tags.
+          // Keep their id/attribution on text rewrites, just as the projection
+          // patch path does. Positional attribution is accepted only for one
+          // text part by the shared protection predicate.
+          const attributed = raw as ResponseInputMessage;
+          if (
+            ("id" in attributed ||
+              "internal_chat_message_metadata_passthrough" in attributed) &&
+            isPlainTextResponsesSystemItem(attributed)
+          ) {
+            out.push({
+              ...attributed,
+              content:
+                typeof attributed.content === "string"
+                  ? text
+                  : patchTextParts(attributed.content, text),
+            });
+          } else {
+            out.push({
+              type: "message",
+              role: rawMsg.role,
+              content:
+                typeof rawMsg.content === "string"
+                  ? text
+                  : [{ type: "input_text", text }],
+            } as ResponseInputItem);
+          }
         } else {
           out.push(raw as ResponseInputItem);
         }
