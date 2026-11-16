@@ -36,6 +36,23 @@ export function noteCompressionForPrefixRefresh(session: Session): void {
     if (state?.last && !state.pending) state.pending = state.last;
 }
 
+function safeResponsesNamespace(tool: Json): boolean {
+    const pending: unknown[] = [tool];
+    while (pending.length > 0) {
+        const item = pending.pop();
+        if (!obj(item) || typeof item.name !== "string" || item.name.trim().length === 0) return false;
+        if (item.type === "namespace") {
+            if (!Array.isArray(item.tools) || item.tools.length === 0) return false;
+            for (const child of item.tools) pending.push(child);
+        } else if (item.type === "function") {
+            if (item.parameters != null && !obj(item.parameters)) return false;
+        } else if (item.type === "custom") {
+            if (item.format != null && (!obj(item.format) || (item.format.type !== "text" && !(item.format.type === "grammar" && (item.format.syntax === "lark" || item.format.syntax === "regex") && typeof item.format.definition === "string")))) return false;
+        } else return false;
+    }
+    return true;
+}
+
 function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefined {
     if (inp.unsupportedReason) return inp.unsupportedReason;
     if (inp.unsupported) return "unsupported-wire-transform";
@@ -56,7 +73,8 @@ function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefi
     if (inp.protocol === "anthropic" && obj(body.thinking) && body.thinking.type === "enabled" && !/interleaved-thinking/i.test(beta)) return "thinking-budget-exceeds-output-cap";
     const noTools = body.tool_choice === "none" || (obj(body.tool_choice) && body.tool_choice.type === "none");
     if (body.tools !== undefined && !Array.isArray(body.tools)) return "unknown-tools-shape";
-    if (!noTools && Array.isArray(body.tools) && body.tools.some(t => !obj(t) || (inp.protocol === "anthropic" ? t.type !== undefined && t.type !== "custom" : t.type !== "function" && t.type !== "custom"))) return "server-or-unknown-tools";
+    if (inp.protocol === "responses" && Array.isArray(body.tools) && body.tools.some(t => obj(t) && t.type === "namespace" && !safeResponsesNamespace(t))) return "server-or-unknown-tools";
+    if (!noTools && Array.isArray(body.tools) && body.tools.some(t => !obj(t) || (inp.protocol === "anthropic" ? t.type !== undefined && t.type !== "custom" : t.type !== "function" && t.type !== "custom" && !(inp.protocol === "responses" && t.type === "namespace")))) return "server-or-unknown-tools";
     if (inp.protocol === "responses") {
         const endpoint = new URL(inp.url);
         if (endpoint.hostname === "chatgpt.com" && endpoint.pathname.startsWith("/backend-api/")) return "codex-oauth-output-cap-unsupported";

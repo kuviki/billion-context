@@ -641,3 +641,90 @@ test("signed thinking without active thinking is preserved whole on a prefill-ca
     assert.deepEqual(JSON.parse(plan.body).messages, prefix);
     assert.deepEqual(current.messages, [...prefix, { role: "user", content: "new" }]);
 });
+
+const namespaceLeafFunction = { type: "function", name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false }, strict: true };
+const namespaceLeafCustom = { type: "custom", name: "exec", description: "Client-executed only", format: { type: "text" } };
+const toolNamespace = (tools: unknown[], name = "functions"): Json => ({ type: "namespace", name, description: `Tools in ${name}`, tools });
+const namespacedBodies = (tools: unknown[]): [Json, Json] => {
+    const old = { model: "gpt-5", reasoning: { effort: "medium" }, instructions: "keep instructions", stream: false, tools, input: [...A, ...B] };
+    return [old, { ...old, input: [...A, ...C] }];
+};
+
+for (const tools of [
+    [toolNamespace([namespaceLeafCustom, namespaceLeafFunction])],
+    [toolNamespace([toolNamespace([namespaceLeafCustom], "nested"), namespaceLeafFunction])],
+]) {
+    test("Responses safe namespace wrappers warm once with schema and reasoning intact", async () => {
+        const s = session();
+        const [old, current] = namespacedBodies(tools);
+        const original = JSON.stringify(current);
+        await prime(s, old, { protocol: "responses" });
+        response = { status: "completed", output: [{ type: "custom_tool_call", namespace: "functions", name: "exec", call_id: "never-run", input: "DO NOT EXECUTE" }] };
+        await warm(s, current, { protocol: "responses" });
+        await beforeCachePrefixRefresh(input(s, current, { protocol: "responses" }));
+        assert.equal(requests.length, 1, "only a warm request; returned calls are discarded, not run or retried");
+        assert.equal(JSON.stringify(requests[0].body.tools), JSON.stringify(tools));
+        assert.deepEqual(requests[0].body, { ...current, input: A, max_output_tokens: 16, store: false });
+        assert.equal(JSON.stringify(current), original);
+        assert(logs.some(x => x.includes("[cache-prefix-refresh] success") && x.includes("retry=0")));
+    });
+}
+
+test("Responses namespace recursively blocks malformed, unknown and hosted children, even with none", async () => {
+    const invalid: unknown[] = [
+        { type: "namespace", name: "functions" }, toolNamespace([]), { ...toolNamespace([]), tools: null },
+        { ...toolNamespace([namespaceLeafFunction]), name: "" },
+        toolNamespace([null]), toolNamespace([{}]), toolNamespace([{ type: "function" }]),
+        toolNamespace([{ type: "function", name: "bad", parameters: [] }]),
+        toolNamespace([{ type: "custom", name: 1 }]),
+        toolNamespace([{ type: "custom", name: "bad", format: [] }]),
+        toolNamespace([{ type: "custom", name: "bad", format: { type: "grammar", syntax: "unknown", definition: "x" } }]),
+        toolNamespace([{ type: "web_search_preview" }]),
+        toolNamespace([toolNamespace([{ type: "mcp", name: "remote", server_url: "https://not-called.invalid" }], "nested")]),
+        toolNamespace([toolNamespace([{ type: "code_interpreter", name: "execute" }], "nested")]),
+        toolNamespace([toolNamespace([{ type: "unknown", name: "mystery" }], "nested")]),
+    ];
+    for (const entry of invalid) for (const tool_choice of ["auto", "none"]) {
+        const s = session();
+        const [old, current] = namespacedBodies([entry]);
+        old.tool_choice = tool_choice;
+        current.tool_choice = tool_choice;
+        await prime(s, old, { protocol: "responses" });
+        await warm(s, current, { protocol: "responses" });
+    }
+    assert.equal(requests.length, 0);
+    assert.equal(logs.filter(x => x.includes("reason=server-or-unknown-tools")).length, invalid.length * 2);
+});
+
+test("safe namespace support does not weaken Codex OAuth or learned output-cap guards", async () => {
+    const [old, current] = namespacedBodies([toolNamespace([namespaceLeafCustom])]);
+    const oauth = session();
+    const endpoint = "https://chatgpt.com/backend-api/codex/responses";
+    await prime(oauth, old, { protocol: "responses", url: endpoint });
+    await warm(oauth, current, { protocol: "responses", url: endpoint });
+    assert(logs.some(x => x.includes("reason=codex-oauth-output-cap-unsupported")));
+    const learned = session();
+    learned.metadata = { preflightNoMaxOutputTokens: { [`${url}\u0000gpt-5`]: true } };
+    await prime(learned, old, { protocol: "responses" });
+    await warm(learned, current, { protocol: "responses" });
+    assert(logs.some(x => x.includes("reason=learned-output-cap-unsupported")));
+    assert.equal(requests.length, 0);
+});
+
+test("namespace-qualified function and custom history already preserve paired calls unchanged", () => {
+    for (const type of ["function", "custom_tool"] as const) {
+        const call = { type: `${type}_call`, call_id: "paired", name: "exec", namespace: "functions", ...(type === "function" ? { arguments: "{}" } : { input: "code" }) };
+        const output = { type: `${type}_call_output`, call_id: "paired", output: "result" };
+        const prefix = [...A, call, output];
+        const [old, current] = namespacedBodies([toolNamespace([namespaceLeafCustom, namespaceLeafFunction])]);
+        old.input = [...prefix, ...B];
+        current.input = [...prefix, ...C];
+        const complete = buildPrefixRefreshBody(old, current, "responses");
+        assert(complete.body);
+        assert.deepEqual(JSON.parse(complete.body).input, prefix);
+        current.input = [...A, call, { ...output, output: "changed" }, ...C];
+        const partial = buildPrefixRefreshBody(old, current, "responses");
+        assert(partial.body);
+        assert.deepEqual(JSON.parse(partial.body).input, A);
+    }
+});
