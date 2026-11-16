@@ -69,6 +69,27 @@ function validResponsesNamespace(tool: Json): boolean {
     return true;
 }
 
+// Codex's leading declaration carrier is prompt material, not a response
+// boundary. Enable only validated client-executed tools on this new surface;
+// do not inherit the broader historical body.tools namespace policy.
+function validAdditionalTools(item: Json): boolean {
+    if (Object.keys(item).some(k => !["type", "id", "role", "tools"].includes(k))) return false;
+    if (item.id !== undefined && typeof item.id !== "string") return false;
+    if (item.role !== undefined && item.role !== "developer" && item.role !== "system") return false;
+    if (!Array.isArray(item.tools) || item.tools.length === 0) return false;
+    if (!validResponsesNamespace({ type: "namespace", name: "additional_tools", tools: item.tools })) return false;
+    const pending: unknown[] = [...item.tools];
+    while (pending.length > 0) {
+        const tool = pending.pop();
+        if (!obj(tool) || remoteToolDeclaration(tool)) return false;
+        if (tool.execution !== undefined && tool.execution !== "client") return false;
+        if (tool.type !== "namespace" && tool.tools !== undefined) return false;
+        if (tool.type !== "function" && tool.type !== "custom" && tool.type !== "namespace") return false;
+        if (tool.type === "namespace") for (const child of tool.tools as unknown[]) pending.push(child);
+    }
+    return true;
+}
+
 function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefined {
     if (inp.unsupportedReason) return inp.unsupportedReason;
     if (inp.unsupported) return "unsupported-wire-transform";
@@ -119,6 +140,7 @@ function safeEnds(items: unknown[], protocol: WireProtocol, body: Json): Set<num
     const ends = new Set<number>();
     const calls = new Set<string>();
     let reasoningPending = false;
+    let responsesDeclarationPrefix = true;
     const noAnthropicPrefill = (obj(body.thinking) && body.thinking.type !== "disabled") || /claude-(?:opus-4-[67]|sonnet-4-6|mythos-preview)(?:-|$)/i.test(String(body.model));
     for (let i = 0; i < items.length; i++) {
         const item = items[i];
@@ -153,6 +175,13 @@ function safeEnds(items: unknown[], protocol: WireProtocol, body: Json): Set<num
             if (item.role === "tool" && (typeof item.tool_call_id !== "string" || !calls.delete(item.tool_call_id))) break;
             if (item.role === "function" && (typeof item.name !== "string" || !calls.delete(`legacy:${item.name}`))) break;
         } else {
+            if (item.type === "additional_tools") {
+                if (!responsesDeclarationPrefix || !validAdditionalTools(item)) break;
+                // Preserve the whole item via the final prefix slice, but do
+                // not let declarations alone become a warm-up endpoint.
+                continue;
+            }
+            responsesDeclarationPrefix = false;
             if (item.status === "in_progress") break;
             if (item.type === "function_call" || item.type === "custom_tool_call") {
                 if (typeof item.call_id !== "string" || calls.has(item.call_id)) break;

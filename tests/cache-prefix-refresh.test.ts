@@ -982,3 +982,96 @@ test("current unsupported checks still win after prompt settings change", async 
     assert(logs.some(x => x.includes("reason=main-request-idempotency-key")));
     assert(logs.some(x => x.includes("reason=server-mcp-tools")));
 });
+
+const additionalTools = (tools: unknown[] = [toolNamespace([namespaceLeafFunction, namespaceLeafCustom])]): Json => ({ type: "additional_tools", id: "synthetic-declarations", role: "developer", tools });
+const additionalBodies = (prefix: unknown[]): [Json, Json] => [
+    { model: "plain", input: [...prefix, ...A, ...B], stream: false, tool_choice: "auto", tools: [namespaceLeafFunction] },
+    { model: "plain", input: [...prefix, ...A, ...C], stream: false, tool_choice: "auto", tools: [namespaceLeafFunction] },
+];
+
+test("leading Responses additional_tools stays intact and scanning reaches subsequent messages", () => {
+    for (const declarations of [additionalTools(), { type: "additional_tools", tools: [namespaceLeafFunction] }, additionalTools([toolNamespace([toolNamespace([namespaceLeafCustom], "nested")])])]) {
+        const [old, current] = additionalBodies([declarations]);
+        const original = JSON.stringify(current);
+        const result = buildPrefixRefreshBody(old, current, "responses");
+        assert.ok(result.body);
+        const warm = JSON.parse(result.body);
+        assert.deepEqual(warm.input, [declarations, ...A]);
+        assert.equal(JSON.stringify(warm.input[0]), JSON.stringify(declarations));
+        assert.deepEqual(warm.tools, current.tools);
+        assert.equal(warm.tool_choice, "auto");
+        assert.equal(JSON.stringify(current), original);
+    }
+});
+
+test("additional_tools requires a following legal boundary, exact match and leading position", () => {
+    const declarations = additionalTools();
+    const [old, current] = additionalBodies([declarations]);
+    for (const changed of [
+        { ...current, input: [declarations, ...C] },
+        { ...current, input: [{ ...declarations, id: "changed" }, ...A, ...C] },
+        { ...current, input: [additionalTools([{ ...namespaceLeafFunction, description: "changed" }]), ...A, ...C] },
+    ]) assert.equal(buildPrefixRefreshBody(old, changed, "responses").body, undefined);
+    const [twoOld, twoCurrent] = additionalBodies([declarations, additionalTools([namespaceLeafCustom])]);
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(twoOld, twoCurrent, "responses").body!).input, [declarations, additionalTools([namespaceLeafCustom]), ...A]);
+    const tailDeclOld = { ...old, input: [...A, declarations, ...B] };
+    const tailDeclNew = { ...current, input: [...A, declarations, ...C] };
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(tailDeclOld, tailDeclNew, "responses").body!).input, A, "non-leading declarations cannot enter the warm prefix");
+});
+
+test("additional_tools rejects malformed, unknown and hosted declarations even with none", () => {
+    const invalid: unknown[] = [
+        { type: "additional_tools" }, { ...additionalTools(), tools: [] }, { ...additionalTools(), tools: null },
+        { ...additionalTools(), role: "user" }, { ...additionalTools(), id: 42 }, { ...additionalTools(), unknown_control: true },
+        additionalTools([null]), additionalTools([{}]), additionalTools([{ type: "function" }]),
+        additionalTools([{ ...namespaceLeafFunction, parameters: [] }]), additionalTools([{ ...namespaceLeafCustom, format: { type: "grammar", syntax: "unknown" } }]),
+        additionalTools([toolNamespace([])]), additionalTools([toolNamespace([null])]),
+        additionalTools([{ ...namespaceLeafFunction, execution: "server" }]),
+        additionalTools([{ ...namespaceLeafCustom, tools: [{ type: "web_search" }] }]),
+        ...[{ type: "web_search" }, { type: "code_interpreter" }, { type: "file_search" }, { type: "mcp", server_url: "https://never-called.invalid" }, { type: "connector", connector_id: "synthetic" }, { type: "unknown" }, { ...namespaceLeafFunction, server_url: "https://never-called.invalid" }].flatMap(t => [additionalTools([t]), additionalTools([toolNamespace([toolNamespace([t], "nested")])])]),
+    ];
+    for (const declarations of invalid) for (const tool_choice of [undefined, "auto", "none", { type: "none" }]) {
+        const [old, current] = additionalBodies([declarations]);
+        current.tool_choice = tool_choice;
+        assert.equal(buildPrefixRefreshBody(old, current, "responses").body, undefined, JSON.stringify(declarations));
+    }
+});
+
+test("additional_tools keeps reasoning and function/custom pair boundaries conservative", () => {
+    const declarations = additionalTools();
+    for (const kind of ["function", "custom_tool"]) {
+        const reasoning = { type: "reasoning", id: "synthetic-reasoning", encrypted_content: "opaque" };
+        const call = { type: `${kind}_call`, call_id: "synthetic-call", name: "exec", ...(kind === "function" ? { arguments: "{}" } : { input: "code" }) };
+        const result = { type: `${kind}_call_output`, call_id: "synthetic-call", output: "done" };
+        for (const suffix of [[reasoning], [reasoning, call], [call], [{ ...result, call_id: "orphan" }]]) {
+            const [old, current] = additionalBodies([declarations, ...A, ...suffix]);
+            assert.deepEqual(JSON.parse(buildPrefixRefreshBody(old, current, "responses").body!).input, [declarations, ...A]);
+        }
+        const prefix = [declarations, ...A, reasoning, call, result];
+        const [old, current] = additionalBodies(prefix);
+        assert.deepEqual(JSON.parse(buildPrefixRefreshBody(old, current, "responses").body!).input, [...prefix, ...A]);
+    }
+});
+
+test("real Responses codec additional_tools reaches HTTP warm-up without dropping or executing declarations", async () => {
+    const { responsesToCore, patchResponsesInput } = await import("acp-kernel/wire");
+    const declarations = additionalTools();
+    const [rawOld, rawCurrent] = additionalBodies([declarations]);
+    const encode = (raw: Json): Json => {
+        const projection = responsesToCore(raw as never);
+        return { ...raw, input: patchResponsesInput(projection, projection.msgs) };
+    };
+    const old = encode(rawOld), current = encode(rawCurrent);
+    assert.deepEqual((current.input as unknown[])[0], declarations);
+    const expectedPrefix = (current.input as unknown[]).slice(0, 2);
+    const s = session();
+    response = { status: "completed", output: [{ type: "function_call", call_id: "never-execute", name: "read_file", arguments: "{}" }] };
+    await prime(s, old, { protocol: "responses" });
+    await warm(s, current, { protocol: "responses" });
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0].body.input, expectedPrefix);
+    assert.deepEqual(requests[0].body, { ...current, input: expectedPrefix, max_output_tokens: 16, store: false });
+    const main = await fetch(url, { method: "POST", body: JSON.stringify(current) }); await main.text();
+    assert.equal(requests.length, 2, "warm-up then unchanged main request, no dispatch of returned calls");
+    assert.deepEqual(requests[1].body, current);
+});

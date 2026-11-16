@@ -115,3 +115,64 @@ for (const protocol of ["openai", "anthropic"] as const) for (const stream of [f
         }
     });
 }
+
+test("real Responses relay preserves leading additional_tools in warm prefix before formal request", { timeout: 20_000 }, async () => {
+    _resetPrefixRefreshForTest();
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const sent: Record<string, unknown>[] = [];
+    const upstream = http.createServer(async (req, res) => {
+        const parts: Buffer[] = [];
+        for await (const part of req) parts.push(Buffer.from(part));
+        const value = JSON.parse(Buffer.concat(parts).toString()) as Record<string, unknown>;
+        sent.push(value);
+        const warm = value.max_output_tokens === 16;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: `resp_${sent.length}`, object: "response", status: "completed", model: "plain-test", output: warm
+            ? [{ type: "function_call", id: "fc_warm", call_id: "never-dispatch", name: "acp_status", arguments: "{}" }]
+            : [{ type: "message", id: "msg_reply", role: "assistant", content: [{ type: "output_text", text: "reply", annotations: [] }] }],
+            usage: { input_tokens: warm ? 999 : 100, output_tokens: 1, input_tokens_details: { cached_tokens: warm ? 999 : 80 } } }));
+    });
+    upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
+    const origin = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
+    const opts: ProxyOptions = {
+        port: 0, host: "127.0.0.1", upstream: origin,
+        routes: { [origin]: { models: { "plain-test": { context: 400_000 } }, cacheKeepalive: { refreshAfterCompress: true, refreshTimeoutMs: 900 } } },
+        modelContextLimit: 400_000, kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session", log: false, debug: false,
+        passthrough: false, passthroughSource: null, autoUpdate: false, autoRestartOnUpdate: false,
+        updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
+        compat: { roles: {} }, streamErrorShape: "protocol", mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts); if (!proxy.listening) await once(proxy, "listening");
+    const sid = "refresh-http-responses-declarations";
+    const declarations = { type: "additional_tools", role: "developer", id: "synthetic-tools", tools: [{ type: "namespace", name: "functions", description: "Synthetic tools", tools: [{ type: "function", name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }] }] };
+    const url = `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/${origin}/v1/responses`;
+    const post = async (suffix: string) => {
+        const response = await fetch(url, { method: "POST", signal: AbortSignal.timeout(10_000), headers: { "content-type": "application/json", "x-acp-session": sid, authorization: "Bearer synthetic-key" }, body: JSON.stringify({ model: "plain-test", stream: false, max_output_tokens: 4000, tool_choice: "auto", input: [declarations, { type: "message", role: "user", content: "stable A" }, { type: "message", role: "assistant", content: suffix }, { type: "message", role: "user", content: "stable tail" }] }) });
+        assert.equal(response.status, 200); assert.match(await response.text(), /reply/);
+    };
+    try {
+        await post("OLD B"); assert.equal(sent.length, 1);
+        noteCompressionForPrefixRefresh(getSession(sid));
+        await post("NEW C");
+        assert.equal(sent.length, 3, "normal, prefix warm, normal only; warm acp_status was discarded");
+        const warm = sent[1], formal = sent[2];
+        assert.equal(warm.max_output_tokens, 16);
+        const warmInput = warm.input as unknown[], formalInput = formal.input as unknown[];
+        assert.deepEqual(warmInput[0], declarations);
+        assert.deepEqual(formalInput[0], declarations);
+        assert.deepEqual(warmInput, formalInput.slice(0, warmInput.length));
+        assert.match(JSON.stringify(warmInput), /stable A/);
+        assert.doesNotMatch(JSON.stringify(warmInput), /OLD B|NEW C|stable tail/);
+        assert.match(JSON.stringify(formalInput), /NEW C/);
+        const expected = { ...formal, input: warmInput, max_output_tokens: 16, store: false };
+        assert.deepEqual(warm, expected, "only history/output cap/store differ from formal request");
+        const lines = getCacheLedger(getSession(sid)).lines;
+        assert.equal(lines.length, 2);
+        assert(lines.every(line => line.input === 100), "discarded warm usage stays out of conversation accounting");
+    } finally {
+        await close(proxy); await close(upstream); setRegistryForTest({});
+    }
+});
