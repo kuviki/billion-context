@@ -81,16 +81,12 @@ function validResponsesNamespace(tool: Json, toolsDisabled = false): boolean {
     return true;
 }
 
-// Codex's leading declaration carrier is prompt material, not a response
-// boundary. Enable only validated client-executed tools on this new surface;
-// do not inherit the broader historical body.tools namespace policy.
-function validAdditionalTools(item: Json): boolean {
-    if (Object.keys(item).some(k => !["type", "id", "role", "tools"].includes(k))) return false;
-    if (item.id !== undefined && typeof item.id !== "string") return false;
-    if (item.role !== undefined && item.role !== "developer" && item.role !== "system") return false;
-    if (!Array.isArray(item.tools) || item.tools.length === 0) return false;
-    if (!validResponsesNamespace({ type: "namespace", name: "additional_tools", tools: item.tools })) return false;
-    const pending: unknown[] = [...item.tools];
+// Retain strict client-only definitions for known tool-search results. Opaque
+// input items (including additional_tools) are not validated by this helper.
+function validClientSearchTools(tools: unknown): boolean {
+    if (!Array.isArray(tools) || tools.length === 0) return false;
+    if (!validResponsesNamespace({ type: "namespace", name: "search_result", tools })) return false;
+    const pending: unknown[] = [...tools];
     while (pending.length > 0) {
         const tool = pending.pop();
         if (!obj(tool) || remoteToolDeclaration(tool)) return false;
@@ -102,22 +98,12 @@ function validAdditionalTools(item: Json): boolean {
     return true;
 }
 
-// Historical MCP discovery result, not a live server/tool declaration.
-function validMcpListing(item: Json): boolean {
-    if (Object.keys(item).some(k => !["type", "id", "server_label", "tools", "error"].includes(k))) return false;
-    if (typeof item.id !== "string" || item.id.trim() === "" || typeof item.server_label !== "string" || item.server_label.trim() === "") return false;
-    if (item.error != null || !Array.isArray(item.tools)) return false;
-    return item.tools.every(tool => obj(tool) && typeof tool.name === "string" && tool.name.trim() !== "" && obj(tool.input_schema) &&
-        (tool.description == null || typeof tool.description === "string") && (tool.annotations == null || obj(tool.annotations)) &&
-        Object.keys(tool).every(k => ["name", "input_schema", "description", "annotations"].includes(k)));
-}
-
 function validClientSearchItem(item: Json, output: boolean): item is Json & { call_id: string } {
     const keys = output ? ["type", "id", "call_id", "execution", "status", "tools"] : ["type", "id", "call_id", "execution", "status", "arguments"];
     if (Object.keys(item).some(k => !keys.includes(k)) || item.execution !== "client" ||
         typeof item.call_id !== "string" || item.call_id.trim() === "" ||
         (item.id != null && typeof item.id !== "string") || (item.status !== undefined && item.status !== "completed")) return false;
-    return output ? Array.isArray(item.tools) && (item.tools.length === 0 || validAdditionalTools({ type: "additional_tools", tools: item.tools })) : obj(item.arguments);
+    return output ? Array.isArray(item.tools) && (item.tools.length === 0 || validClientSearchTools(item.tools)) : obj(item.arguments);
 }
 
 function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefined {
@@ -173,8 +159,6 @@ function safeEnds(items: unknown[], protocol: WireProtocol, body: Json): Set<num
     const searchCalls = new Set<string>();
     const seenSearchCalls = new Set<string>();
     let reasoningPending = false;
-    let responsesDeclarationPrefix = true;
-    let mcpListingPrefix = true;
     const noAnthropicPrefill = (obj(body.thinking) && body.thinking.type !== "disabled") || /claude-(?:opus-4-[67]|sonnet-4-6|mythos-preview)(?:-|$)/i.test(String(body.model));
     for (let i = 0; i < items.length; i++) {
         const item = items[i];
@@ -209,14 +193,9 @@ function safeEnds(items: unknown[], protocol: WireProtocol, body: Json): Set<num
             if (item.role === "tool" && (typeof item.tool_call_id !== "string" || !calls.delete(item.tool_call_id))) break;
             if (item.role === "function" && (typeof item.name !== "string" || !calls.delete(`legacy:${item.name}`))) break;
         } else {
-            if (item.type === "additional_tools" || item.type === "mcp_list_tools") {
-                if (!(item.type === "additional_tools" ? responsesDeclarationPrefix && validAdditionalTools(item) : mcpListingPrefix && validMcpListing(item))) break;
-                // Preserve the whole item via the final prefix slice, but do
-                // not let declarations alone become a warm-up endpoint.
-                continue;
-            }
-            responsesDeclarationPrefix = false;
-            if (!((item.type === undefined || item.type === "message") && (item.role === "system" || item.role === "developer"))) mcpListingPrefix = false;
+            // Unlike opaque history, these input commands can authorize a
+            // remote action or request a fresh compaction when replayed.
+            if (item.type === "mcp_approval_response" || item.type === "compaction_trigger") break;
             if (item.status === "in_progress") break;
             if (item.type === "tool_search_call") {
                 if (!validClientSearchItem(item, false) || calls.has(item.call_id) || seenSearchCalls.has(item.call_id)) break;
@@ -235,10 +214,14 @@ function safeEnds(items: unknown[], protocol: WireProtocol, body: Json): Set<num
                 if (typeof item.call_id !== "string" || searchCalls.has(item.call_id) || !calls.delete(item.call_id)) break;
             } else if (item.type === "reasoning") {
                 reasoningPending = true;
-            } else if (item.type === undefined || item.type === "message") {
+            } else if (item.type === "message" || (item.type === undefined && ["user", "assistant", "system", "developer"].includes(String(item.role)))) {
                 if (!["user", "assistant", "system", "developer"].includes(String(item.role))) break;
                 if (item.role === "assistant") reasoningPending = false;
-            } else break;
+            } else {
+                // Exact shared whole items may ride inside a legal prefix,
+                // but cannot end it or resolve pending known calls/reasoning.
+                continue;
+            }
         }
         if (calls.size === 0 && !reasoningPending) ends.add(i + 1);
     }

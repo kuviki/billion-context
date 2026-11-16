@@ -1017,7 +1017,7 @@ test("leading Responses additional_tools stays intact and scanning reaches subse
     }
 });
 
-test("additional_tools requires a following legal boundary, exact match and leading position", () => {
+test("additional_tools requires a following legal boundary and exact match, not a leading position", () => {
     const declarations = additionalTools();
     const [old, current] = additionalBodies([declarations]);
     for (const changed of [
@@ -1029,11 +1029,14 @@ test("additional_tools requires a following legal boundary, exact match and lead
     assert.deepEqual(JSON.parse(buildPrefixRefreshBody(twoOld, twoCurrent, "responses").body!).input, [declarations, additionalTools([namespaceLeafCustom]), ...A]);
     const tailDeclOld = { ...old, input: [...A, declarations, ...B] };
     const tailDeclNew = { ...current, input: [...A, declarations, ...C] };
-    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(tailDeclOld, tailDeclNew, "responses").body!).input, A, "non-leading declarations cannot enter the warm prefix");
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(tailDeclOld, tailDeclNew, "responses").body!).input, A, "trailing declaration alone is not a boundary");
+    const withFollowingMessage = { ...tailDeclNew, input: [...A, declarations, ...A, ...C] };
+    const previousFollowingMessage = { ...tailDeclOld, input: [...A, declarations, ...A, ...B] };
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(previousFollowingMessage, withFollowingMessage, "responses").body!).input, [...A, declarations, ...A]);
 });
 
-test("additional_tools rejects malformed, unknown and hosted declarations even with none", () => {
-    const invalid: unknown[] = [
+test("opaque additional_tools passes whole unchanged item interiors without bespoke declaration gates", () => {
+    const opaqueVariants: unknown[] = [
         { type: "additional_tools" }, { ...additionalTools(), tools: [] }, { ...additionalTools(), tools: null },
         { ...additionalTools(), role: "user" }, { ...additionalTools(), id: 42 }, { ...additionalTools(), unknown_control: true },
         additionalTools([null]), additionalTools([{}]), additionalTools([{ type: "function" }]),
@@ -1043,10 +1046,10 @@ test("additional_tools rejects malformed, unknown and hosted declarations even w
         additionalTools([{ ...namespaceLeafCustom, tools: [{ type: "web_search" }] }]),
         ...[{ type: "web_search" }, { type: "code_interpreter" }, { type: "file_search" }, { type: "mcp", server_url: "https://never-called.invalid" }, { type: "connector", connector_id: "synthetic" }, { type: "unknown" }, { ...namespaceLeafFunction, server_url: "https://never-called.invalid" }].flatMap(t => [additionalTools([t]), additionalTools([toolNamespace([toolNamespace([t], "nested")])])]),
     ];
-    for (const declarations of invalid) for (const tool_choice of [undefined, "auto", "none", { type: "none" }]) {
+    for (const declarations of opaqueVariants) for (const tool_choice of [undefined, "auto", "none", { type: "none" }]) {
         const [old, current] = additionalBodies([declarations]);
         current.tool_choice = tool_choice;
-        assert.equal(buildPrefixRefreshBody(old, current, "responses").body, undefined, JSON.stringify(declarations));
+        assert.deepEqual(JSON.parse(buildPrefixRefreshBody(old, current, "responses").body!).input, [declarations, ...A]);
     }
 });
 
@@ -1096,7 +1099,7 @@ const searchPair = (): [Json, Json] => [
     { type: "tool_search_output", id: "synthetic-output", call_id: "synthetic-search", status: "completed", execution: "client", tools: [toolNamespace([namespaceLeafFunction])] },
 ];
 
-test("mcp_list_tools leading inert listings preserve bytes but are not endpoints", () => {
+test("opaque mcp_list_tools preserves exact interiors but supplies no endpoint", () => {
     const listing = mcpListing();
     const prefix = [additionalTools(), listing];
     const [old, current] = additionalBodies(prefix);
@@ -1108,15 +1111,15 @@ test("mcp_list_tools leading inert listings preserve bytes but are not endpoints
     assert.equal(buildPrefixRefreshBody(old, { ...current, input: [...prefix, ...C] }, "responses").body, undefined);
     assert.equal(buildPrefixRefreshBody(old, { ...current, input: [additionalTools(), { ...listing, server_label: "changed" }, ...A, ...C] }, "responses").body, undefined);
     const [laterOld, laterCurrent] = additionalBodies([...A, listing]);
-    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(laterOld, laterCurrent, "responses").body!).input, A);
-    for (const invalid of [
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(laterOld, laterCurrent, "responses").body!).input, [...A, listing, ...A]);
+    for (const opaque of [
         { ...listing, id: undefined }, { ...listing, server_label: "" }, { ...listing, tools: {} }, { ...listing, error: "failed" },
         { ...listing, server_url: "https://never-called.invalid" }, { ...listing, tools: [{ type: "function", name: "tool", input_schema: {} }] },
         { ...listing, tools: [{ name: "tool", input_schema: [], annotations: {} }] },
         { ...listing, tools: [{ name: "tool", input_schema: {}, execution: "server" }] },
     ]) {
-        const [a, b] = additionalBodies([invalid]);
-        assert.equal(buildPrefixRefreshBody(a, b, "responses").body, undefined);
+        const [a, b] = additionalBodies([opaque]);
+        assert.equal(JSON.stringify(JSON.parse(buildPrefixRefreshBody(a, b, "responses").body!).input), JSON.stringify([opaque, ...A]));
     }
 });
 
@@ -1166,4 +1169,52 @@ test("top-level tool_search enables only validated explicit client mode, preserv
     const before = requests.length;
     await prime(s, old, { protocol: "responses" }); await warm(s, current, { protocol: "responses" });
     assert.equal(requests.length, before + 1); assert.equal(requests[before].body.tool_choice, "none");
+});
+
+test("Responses exact shared prefix crosses opaque item 39 and mid-history declarations to legal item 60", () => {
+    const shared: Json[] = Array.from({ length: 60 }, (_, i) => ({ type: "message", role: i % 2 ? "assistant" : "user", content: `synthetic item ${i + 1}` }));
+    shared[38] = { type: "configuration_update", vendor_configuration: { nested: ["keep", { exact: true }] } };
+    shared[44] = { type: "additional_tools", role: "developer", tools: [{ type: "vendor_tool", arbitrary_schema: { keep: "unchanged" } }] };
+    shared[52] = { type: "vendor_future_event", payload: { ordered: [3, 1, 2] } };
+    const previous = { model: "plain", input: [...shared, { type: "message", role: "assistant", content: "old item 61" }] };
+    const current = { model: "plain", input: [...shared, { type: "message", role: "assistant", content: "new item 61" }], tool_choice: "auto" };
+    const original = JSON.stringify(current);
+    const warm = JSON.parse(buildPrefixRefreshBody(previous, current, "responses").body!);
+    assert.equal(warm.input.length, 60);
+    assert.equal(JSON.stringify(warm.input), JSON.stringify(shared));
+    assert.equal(JSON.stringify(current), original);
+    const changed = { ...current, input: [...shared.slice(0, 38), { ...shared[38], vendor_configuration: { changed: true } }, ...shared.slice(39), { type: "message", role: "assistant", content: "new item 61" }] };
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(previous, changed, "responses").body!).input, shared.slice(0, 38), "never jump over a mismatched whole item");
+});
+
+test("opaque Responses items never supply an endpoint or clear known call/reasoning debt", () => {
+    const opaque = [{ type: "configuration_update", config: { a: 1 } }, { type: "additional_tools", vendor_data: [1] }, { type: "mcp_list_tools", vendor_data: { any: "shape" } }, { type: "future_kind" }, { vendor_record: true }];
+    const pair = (common: unknown[]) => [{ model: "plain", input: [...common, ...B] }, { model: "plain", input: [...common, ...C] }] as [Json, Json];
+    assert.equal(buildPrefixRefreshBody(...pair(opaque), "responses").body, undefined);
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(...pair([...A, ...opaque]), "responses").body!).input, A);
+    const call = { type: "function_call", call_id: "pending", name: "read", arguments: "{}" };
+    const reasoning = { type: "reasoning", encrypted_content: "synthetic" };
+    for (const debt of [call, reasoning]) {
+        assert.deepEqual(JSON.parse(buildPrefixRefreshBody(...pair([...A, debt, ...opaque, { type: "message", role: "user", content: "does not settle debt" }]), "responses").body!).input, A);
+    }
+    const settled = [...A, call, ...opaque, { type: "function_call_output", call_id: "pending", output: "done" }];
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(...pair(settled), "responses").body!).input, settled);
+    const reasoned = [...A, reasoning, ...opaque, { type: "message", role: "assistant", content: "resolved" }];
+    assert.deepEqual(JSON.parse(buildPrefixRefreshBody(...pair(reasoned), "responses").body!).input, reasoned);
+});
+
+test("known malformed groups, explicit in-progress and replay commands remain barriers", () => {
+    for (const barrier of [
+        { type: "function_call_output", call_id: "orphan", output: "bad" },
+        { type: "custom_tool_call_output", call_id: "orphan", output: "bad" },
+        { type: "message", role: "invalid", content: "bad" },
+        { type: "future_event", status: "in_progress" },
+        { type: "mcp_approval_response", approval_request_id: "synthetic", approve: true },
+        { type: "mcp_approval_response", approval_request_id: "synthetic", approve: false },
+        { type: "compaction_trigger" },
+    ]) {
+        const prefix = [...A, { type: "configuration_update", exact: "opaque" }, barrier, { type: "message", role: "assistant", content: "later legal message" }];
+        const old = { model: "plain", input: [...prefix, ...B] }, current = { model: "plain", input: [...prefix, ...C] };
+        assert.deepEqual(JSON.parse(buildPrefixRefreshBody(old, current, "responses").body!).input, A, JSON.stringify(barrier));
+    }
 });

@@ -150,13 +150,14 @@ for (const searchHistory of [false, true]) test(`real Responses relay preserves 
     const declarations = { type: "additional_tools", role: "developer", id: "synthetic-tools", tools: [{ type: "namespace", name: "functions", description: "Synthetic tools", tools: [{ type: "function", name: "read_file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }] }] };
     const listing = { type: "mcp_list_tools", id: "synthetic-list", server_label: "synthetic-server", tools: [{ name: "read_file", input_schema: { type: "object", properties: {} } }] };
     const search = { type: "tool_search", execution: "client", parameters: { type: "object", properties: { query: { type: "string" } } } };
+    const opaqueInterior = [{ type: "vendor_cache_note", payload: { exact: ["keep", 7] } }, { ...declarations, id: "synthetic-mid-tools" }];
     const pair = [
         { type: "tool_search_call", execution: "client", status: "completed", call_id: "synthetic-search", arguments: { query: "read" } },
         { type: "tool_search_output", execution: "client", status: "completed", call_id: "synthetic-search", tools: declarations.tools },
     ];
     const url = `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/${origin}/v1/responses`;
     const post = async (suffix: string) => {
-        const response = await fetch(url, { method: "POST", signal: AbortSignal.timeout(10_000), headers: { "content-type": "application/json", "x-acp-session": sid, authorization: "Bearer synthetic-key" }, body: JSON.stringify({ model: "plain-test", stream: false, max_output_tokens: 4000, tool_choice: "auto", ...(searchHistory ? { tools: [search] } : {}), input: [declarations, ...(searchHistory ? [listing] : []), { type: "message", role: "user", content: "stable A" }, ...(searchHistory ? pair : []), { type: "message", role: "assistant", content: suffix }, { type: "message", role: "user", content: "stable tail" }] }) });
+        const response = await fetch(url, { method: "POST", signal: AbortSignal.timeout(10_000), headers: { "content-type": "application/json", "x-acp-session": sid, authorization: "Bearer synthetic-key" }, body: JSON.stringify({ model: "plain-test", stream: false, max_output_tokens: 4000, tool_choice: "auto", ...(searchHistory ? { tools: [search] } : {}), input: [declarations, ...(searchHistory ? [listing] : []), { type: "message", role: "user", content: "stable A" }, ...(searchHistory ? [...opaqueInterior, ...pair] : []), { type: "message", role: "assistant", content: suffix }, { type: "message", role: "user", content: "stable tail" }] }) });
         assert.equal(response.status, 200); assert.match(await response.text(), /reply/);
     };
     try {
@@ -170,7 +171,7 @@ for (const searchHistory of [false, true]) test(`real Responses relay preserves 
         assert.deepEqual(warmInput[0], declarations);
         assert.deepEqual(formalInput[0], declarations);
         if (searchHistory) {
-            for (const item of [listing, ...pair]) assert.ok(warmInput.some(x => JSON.stringify(x) === JSON.stringify(item)), "listing and completed client search pair retained byte-for-byte");
+            for (const item of [listing, ...opaqueInterior, ...pair]) assert.ok(warmInput.some(x => JSON.stringify(x) === JSON.stringify(item)), "listing and completed client search pair retained byte-for-byte");
             assert.ok((warm.tools as unknown[]).some(x => JSON.stringify(x) === JSON.stringify(search)));
         }
         assert.deepEqual(warmInput, formalInput.slice(0, warmInput.length));
