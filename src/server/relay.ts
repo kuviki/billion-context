@@ -1,3 +1,4 @@
+import { waitPostFold } from "../post-fold-delay.js";
 import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
 import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
@@ -794,9 +795,12 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
     // proxied URL is the only useful signal in the log.
-    log("info", currentFetchTransport()
+    const postFoldDelayMs = resolveCompress(opts.routes, upstreamUrl, throttleModelHint ?? prepared?.model ?? requestModelFromBody(wireBody, req), opts.compress).postFoldDelayMs;
+    const deferForwardLog = (postFoldDelayMs ?? 0) > 0;
+    const logForward = (suffix = "") => log("info", (currentFetchTransport()
         ? `forward WS → ${maskUrlForLog(upstreamUrl.replace(/^http/, "ws"))}`
-        : `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
+        : `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`) + suffix);
+    if (!deferForwardLog) logForward();
     if (opts.debug && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);
@@ -1290,6 +1294,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             return;
         }
     }
+    let postFoldSuffix = "";
+    try {
+        if (mainSend && prepared) postFoldSuffix = await waitPostFold(prepared.session, prepared.processedMessages, postFoldDelayMs, clientAbort.signal, requestBody);
+    } catch (error) {
+        releaseUpstreamThrottleProbe(throttleProbeToken);
+        throw error;
+    }
+    if (deferForwardLog) logForward(postFoldSuffix);
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     // #3701: the catch below replaces upstreamResult on a shrunken resend; capture the
     // FIRST attempt's timer handle separately because upstreamResult may never have been
@@ -1951,8 +1963,11 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 const s = prepared.session;
                 const armedWindow = overflowInfo.window ?? (s.stats.lastInputTokensSource === "overflow-arm" ? Math.floor(s.stats.lastInputTokens * 0.9) : undefined);
                 // Keep the latest complete upstream verdict if recovery cannot continue.
-                const resendOverflow = async (retryBody: string | Buffer): Promise<ContextOverflowInfo | null> => {
-                    const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(retryBody) }, undefined, clientAbort.signal);
+                let refoldDelay = "";
+                const resendOverflow = async (retryBody: string | Buffer, foldedPrepared?: Prepared | null): Promise<ContextOverflowInfo | null> => {
+                    const finalRetryBody = await finalizeEgress(retryBody);
+                    if (foldedPrepared) refoldDelay = await waitPostFold(foldedPrepared.session, foldedPrepared.processedMessages, postFoldDelayMs, clientAbort.signal, finalRetryBody);
+                    const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: finalRetryBody }, undefined, clientAbort.signal);
                     upstreamResult.clearTimer();
                     if (retried.response.ok) {
                         wireBody = retryBody; // #1900: the accepted body is the next wire base
@@ -1993,14 +2008,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         const refolded = await overflowRefold(rejection.window ?? armedWindow).catch(() => null);
                         if (refolded) {
                             const retryBody = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
-                            rejection = await resendOverflow(retryBody);
+                            rejection = await resendOverflow(retryBody, refolded.prepared);
                             if (mayRetryWithCap && rejection?.isOverflow && !clientAbort.signal.aborted) {
                                 const foldedCap = capOverflowOutput(retryBody, rejection);
                                 if (foldedCap !== null) rejection = await resendWithCap(foldedCap);
                             }
                             if (rejection === null) {
                                 prepared = refolded.prepared;
-                                log("info", `[${s.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
+                                log("info", `[${s.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)${refoldDelay}`);
                             }
                         }
                     }
@@ -2821,7 +2836,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
                 // single adoption point or parseStream sees no candidates.
-                { url: upstreamUrl, headers: reqHeaders, model: throttleModel, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", reqHeaders), responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
+                { url: upstreamUrl, headers: reqHeaders, model: throttleModel, postFoldDelayMs, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", reqHeaders), responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,

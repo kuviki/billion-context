@@ -27,6 +27,8 @@
 
 **出站。** `stream-*` 按 wire 改写上游 SSE（块框架、cache-control 断点 #1637、`wire-body` 尾 user 回合补位）。请求侧另有用户可注册的 `egressTransforms[]` 管道（`src/egress-transforms.ts`，#6003）：ESM 插件在所有会话处理之后、re-sign/v1Wrap 之前改写每个出站模型请求体——逐插件 fail-open，可经 `/__bili/config/reload` 热重载，未配置时严格 no-op。协议头（pf-*/信封）永不出代理——上游 hop 头白名单剥掉它们。
 
+启用 `compress.postFoldDelayMs` 时，只在首次发出带有新压缩结果的模型请求前等待。不改变请求字节、传输方式或重试策略，不发送预热请求。
+
 **闸门与恢复。** `preflight.ts`（hold 宽限、死路冷却）、`reasoning-guard`（签名载荷永不进折叠输入）、`request-body-budget`（收/解/发字节预算，可用性大于性能 #3128）、`content-encoding`（解压炸弹守卫，413）。错误形态：`stream-error`（最小 SSE 错误+收尾）、`fake-completion`（可选重试提示）、`degenerate-turn` / `degenerate-retry`、`exit-matrix`（wire 出口 × 关注点，#588）。
 
 ## 关键入口

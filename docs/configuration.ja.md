@@ -351,6 +351,7 @@
 | `compress.reasoning.drop` | boolean | true | — | 閾値を超える長さの完了ラウンド推論実行を破棄する。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 完了推論実行を破棄する文字数閾値。 |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars の非推奨エイリアス（受け入れられ、それにマッピングされる）。 _(非推奨)_ |
+| `compress.postFoldDelayMs` | integer (milliseconds) | 0 | — | 新たな圧縮結果を含む最初のモデルリクエストの送信前に一度だけ待機します。範囲は 0～120,000 ms で、0 は無効です。グローバル、プロバイダー、モデル単位で設定でき、予熱リクエストは送信しません。 |
 
 **プロバイダールートフィールド**
 

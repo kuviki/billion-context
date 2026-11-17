@@ -27,6 +27,8 @@ Every model-traffic request that reaches the proxy passes through this module: i
 
 **Egress.** `stream-*` rewrites the upstream SSE per wire (chunk framing, cache-control breakpoints #1637, `wire-body` trailing-user-turn append). On the request side, a user-registerable `egressTransforms[]` pipeline (`src/egress-transforms.ts`, #6003) runs ESM plugins over every outbound model-request body after session processing and before re-sign/v1Wrap — fail-open per plugin, hot-reloadable via `/__bili/config/reload`, an exact no-op when unconfigured. Protocol headers (pf-*/envelope) never leave the proxy — the upstream hop-header list strips them.
 
+When enabled, `compress.postFoldDelayMs` delays only the first model send carrying a newly committed fold. It does not change request bytes, transport, or retry policy, and sends no prewarm request.
+
 **Gates & recovery.** `preflight.ts` (hold grace, dead-end cooldown), `reasoning-guard` (signed payloads are never fold inputs), `request-body-budget` (receive/decode/send byte caps, availability over performance #3128), `content-encoding` (decompression-bomb guard, 413). Error shapes: `stream-error` (minimal SSE error + finish), `fake-completion` (opt-in retry hint), `degenerate-turn` / `degenerate-retry`, and `exit-matrix` (wire-exit × concerns, #588).
 
 ## Key entries

@@ -24,6 +24,25 @@ test("mergeCompress: model beats provider beats global, per field", () => {
     assert.equal(merged.minCompressRangeChars, 4000);
 });
 
+test("postFoldDelayMs: optional bounded integer with an explicit zero override", () => {
+    assert.equal(parseCompressSettings({})?.postFoldDelayMs, undefined);
+    for (const delay of [0, 2000, 120_000]) {
+        assert.equal(parseCompressSettings({ postFoldDelayMs: delay })?.postFoldDelayMs, delay);
+    }
+    for (const delay of [-1, 0.5, 120_001, "2000", null, true]) {
+        assert.equal(parseCompressSettings({ postFoldDelayMs: delay }), undefined);
+    }
+    const route = parseRouteEntry({
+        compress: { postFoldDelayMs: 1500 },
+        models: { "fast-model": { compress: { postFoldDelayMs: 0 } } },
+    });
+    assert.ok(route);
+    const routes: ProviderRoutes = { "https://api.example.com": route };
+    assert.equal(resolveCompress(routes, "https://api.example.com/v1", "fast-model", { postFoldDelayMs: 2000 }).postFoldDelayMs, 0);
+    assert.equal(resolveCompress(routes, "https://api.example.com/v1", "other-model", { postFoldDelayMs: 2000 }).postFoldDelayMs, 1500);
+    assert.equal(resolveCompress(routes, "https://other.example.com", "fast-model", { postFoldDelayMs: 2000 }).postFoldDelayMs, 2000);
+});
+
 test("mergeCompress: undefined at deeper level does not clear shallower value", () => {
     const merged = mergeCompress({ nudgeGrowthTokens: 50000 }, undefined, { emergencyThresholdPercent: 0.85 });
     assert.equal(merged.nudgeGrowthTokens, 50000);

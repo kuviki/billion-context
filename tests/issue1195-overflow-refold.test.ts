@@ -196,6 +196,62 @@ test("e2e #1195 A: stated-window overflow is rescued within the SAME request —
     assert.equal(s!.stats.lastInputTokensSource, "usage");
 });
 
+test("post-fold delay runs before the v216 overflow refold retry without extra requests", async (t) => {
+    let summaryAt = 0;
+    let retryAt = 0;
+    const upstream = await recordedUpstream((call, res) => {
+        if (call === 0) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(STATED_OVERFLOW_BODY_128K);
+        } else {
+            retryAt = performance.now();
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.end(okSse());
+        }
+    }, () => { summaryAt = performance.now(); return summaryJson(); });
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    // The operator declared 400k — the upstream just proved the REAL window is 128k.
+    const options = proxyBaseOptions(upstream.port, 400_000);
+    options.compress = { ...options.compress, postFoldDelayMs: 50 };
+    const proxy = await startServer(options);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    t.after(async () => {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.server.close();
+        upstream.server.closeIdleConnections?.();
+        await once(upstream.server, "close");
+    });
+
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstream.port}/v1/messages`;
+    const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
+    const headers = { "content-type": "application/json", "x-acp-session": "refold-a-delay" };
+
+    const r1 = await fetch(url, { method: "POST", headers, body });
+    assert.equal(r1.status, 200, "the client never sees the 400 — the turn is rescued in-request");
+    assert.match(r1.headers.get("content-type") ?? "", /text\/event-stream/);
+    const r1text = await r1.text();
+    assert.ok(r1text.includes("text_delta"), "the retry's SSE stream is delivered");
+
+    assert.ok(summaryAt > 0 && retryAt - summaryAt >= 45, `refold retry must wait: ${retryAt - summaryAt} ms`);
+
+    // bodies: [0] original 400'd forward, [1] summarization call, [2] retry.
+    assert.equal(upstream.bodies.length, 3, `one overflow + one summary + one retry: ${upstream.bodies.length}`);
+    assert.ok(upstream.bodies[0].includes("MARKER_1_") && upstream.bodies[0].includes("MARKER_11_"), "first forward carried the full history");
+    assert.ok(upstream.bodies[2].includes(SUMMARY_TEXT), "the retry carries the fold summary");
+    assert.ok(upstream.bodies[2].includes("MARKER_11_") && !upstream.bodies[2].includes("MARKER_1_"), "the retry keeps the recent tail, drops the folded early range");
+    assert.ok(upstream.bodies[2].length < upstream.bodies[0].length, "the retried body is smaller than the rejected one");
+
+    const s = listSessions().find((x) => x.id === "refold-a-delay");
+    assert.ok(s, "session exists");
+    assert.equal(s!.metadata.confirmedContextLimits, undefined, "#987: nothing learned — the declared window keeps governing");
+    assert.equal(s!.stats.lastInputTokensSource, "usage");
+});
+
 test("e2e #1195 B: an unfoldable payload passes the ORIGINAL overflow 400 through verbatim — the refold is not a client-visible change", async (t) => {
     const upstream = await recordedUpstream((_call, res) => {
         res.writeHead(400, { "content-type": "application/json" });

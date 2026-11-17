@@ -1,3 +1,4 @@
+import { waitPostFold } from "../src/post-fold-delay.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { resolveDecompress } from "../src/decompress-shared.ts";
@@ -81,8 +82,10 @@ test("toFile spill (>10K chars) does NOT flip the flag — material lives in a t
     assert.notEqual(after.restoredInline, true, "toFile restore must not mark the block (frozen contract: file mode behavior fully unchanged)");
 });
 
-test("end-to-end: decompress then re-compress same span refolds in place (proxy-shaped empty view)", () => {
+test("end-to-end: decompress then re-compress same span refolds in place (proxy-shaped empty view)", async () => {
     const { ctx, session, block, msgs } = compressARange();
+    const summaryView = [{ id: `acp_summary_${block.blockId}`, role: "system" as const, contentType: "text" as const, text: block.summary }];
+    assert.match(await waitPostFold(session, summaryView, 1, undefined, JSON.stringify(summaryView)), /postFoldDelayMs=1/);
     resolveDecompress({ blockId: block.blockId }, ctx as never);
     // Proxy-shaped next round: the originals left the wire view; only the flag
     // tells the kernel the model holds the material via the kept tool result.
@@ -99,6 +102,9 @@ test("end-to-end: decompress then re-compress same span refolds in place (proxy-
     assert.equal(after.summary, refoldSummary);
     assert.notEqual(after.restoredInline, true, "marker cleared after refold");
     assert.equal(session.state.blocks.length, 1, "no second block created");
+    assert.equal(await waitPostFold(session, summaryView, 1, undefined, JSON.stringify(summaryView)), "", "stale generation cannot consume the in-place refold");
+    summaryView[0].text = refoldSummary;
+    assert.match(await waitPostFold(session, summaryView, 1, undefined, JSON.stringify(summaryView)), /postFoldDelayMs=1/);
     void msgs;
 });
 

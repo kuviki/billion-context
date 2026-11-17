@@ -1,3 +1,4 @@
+import { waitPostFold } from "../post-fold-delay.js";
 import {
     hideConsumedCompressCalls,
     type CompressionCore,
@@ -288,6 +289,7 @@ export interface LoopCtx {
 }
 
 export interface RequestOptions {
+    postFoldDelayMs?: number;
     url: string;
     /** Exact request model when this wire carries it in a URL/envelope instead of the body. */
     model?: string;
@@ -574,6 +576,7 @@ export async function* runCompressLoop(
     // but one copy per request is enough signal for humans).
     const seenMarkers = new Set<string>();
 
+    let rerequestLog: string | undefined;
     const fetchUpstream = async (body: Record<string, unknown>) => {
         // #1592-family seam forensics: remember the body actually sent so the
         // next usage settle can pair it with the previous one (LCP on miss).
@@ -628,6 +631,9 @@ export async function* runCompressLoop(
             if (wireBodyStr !== beforeEgress) wireShedRewrote = true;
         }
         requestOptions.resign?.(requestOptions.headers, wireBodyStr);
+        const postFoldSuffix = await waitPostFold(ctx.session, coreMessages, requestOptions.postFoldDelayMs, signal, wireBodyStr);
+        if (rerequestLog) { ctx.log(rerequestLog + postFoldSuffix); rerequestLog = undefined; }
+
         // #2131 follow-up: the message array lives under `messages` (chat),
         // `input` (Responses) or `contents` (Google) depending on wire shape.
         const wireArr = [wireObj.messages, wireObj.input, wireObj.contents].find((v): v is unknown[] => Array.isArray(v));
@@ -1807,7 +1813,9 @@ export async function* runCompressLoop(
                 }
             }
 
-            ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
+            const sendLog = `[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`;
+            if ((requestOptions.postFoldDelayMs ?? 0) > 0) rerequestLog = sendLog;
+            else ctx.log(sendLog);
 
             if (signal?.aborted) break;
 

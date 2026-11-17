@@ -354,6 +354,7 @@
 | `compress.reasoning.drop` | boolean | true | — | 丢弃超过阈值的已结束轮次推理块。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 已结束推理块被丢弃的字符阈值。 |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars 的弃用别名（接受，映射到后者）。 _(已弃用)_ |
+| `compress.postFoldDelayMs` | integer (milliseconds) | 0 | — | 首次发出带有新压缩结果的正式模型请求前，仅等待一次。范围 0–120,000 毫秒；0 为关闭。支持全局、供应商和模型三级配置。不会发送预热请求。 |
 
 **路由表字段**
 
