@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { credentialFingerprint } from "./cache-ledger.js";
 import { DEFAULT_CACHE_REFRESH_TIMEOUT_MS, MAX_CACHE_REFRESH_TIMEOUT_MS } from "./config.js";
 import { fetchWithTimeout } from "./fetch-util.js";
-import { currentFetchTransport, isWsLaneTransport } from "./fetch-transport.js";
+import { currentFetchTransport, currentWsDirectHeaders, isWsLaneTransport } from "./fetch-transport.js";
 import { log } from "./logger.js";
 import type { Session } from "./session.js";
 import { usageTotals, type WireProtocol } from "./util.js";
@@ -19,6 +19,9 @@ const equal = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.st
 export interface PrefixRefreshInput {
     session: Session;
     enabled: boolean;
+    refreshWebSocketViaSse?: boolean;
+    /** A WS anchored fast delta is not a proven full standalone history. */
+    incompleteHistory?: boolean;
     timeoutMs?: number;
     protocol: WireProtocol | undefined;
     body: string | Buffer;
@@ -109,7 +112,7 @@ function validClientSearchItem(item: Json, output: boolean): item is Json & { ca
 function unsupportedReason(inp: PrefixRefreshInput, body: Json): string | undefined {
     if (inp.unsupportedReason) return inp.unsupportedReason;
     if (inp.unsupported) return "unsupported-wire-transform";
-    if (isWsLaneTransport(currentFetchTransport())) return "stateful-websocket-transport";
+    if (isWsLaneTransport(currentFetchTransport()) && (!inp.refreshWebSocketViaSse || inp.protocol !== "responses")) return "stateful-websocket-transport";
     if (body.previous_response_id) return "previous-response-state";
     if (body.conversation || body.thread_id) return "server-conversation-state";
     if (body.container) return "server-container-state";
@@ -148,6 +151,10 @@ function parseSnapshot(inp: PrefixRefreshInput): { snapshot?: Snapshot; reason?:
     let body: unknown;
     try { body = JSON.parse(inp.body.toString()); } catch { return { reason: "non-json-wire-body" }; }
     if (!obj(body)) return { reason: "non-object-wire-body" };
+    if (isWsLaneTransport(currentFetchTransport())) {
+        if (inp.incompleteHistory || body.previous_response_id) return { reason: "incomplete-websocket-history" };
+        if (body.generate === false || (obj(body.prompt_cache_options) && body.prompt_cache_options.prewarm === true)) return { reason: "websocket-client-prewarm" };
+    }
     const tenantHeaders = Object.entries(inp.headers).filter(([k]) => /^(openai-organization|openai-project)$/i.test(k)).map(([k, v]) => [k.toLowerCase(), v]).sort();
     const namespace = createHash("sha256").update(JSON.stringify([inp.url, inp.protocol, body.model, credentialFingerprint(inp.headers), tenantHeaders])).digest("hex");
     return { snapshot: { body, namespace, order: 0, skipReason: unsupportedReason(inp, body) } };
@@ -314,7 +321,20 @@ function responseResult(text: string, stream: boolean, protocol: WireProtocol): 
 async function sendRefresh(inp: PrefixRefreshInput, body: string): Promise<void> {
     const timeoutMs = Number.isSafeInteger(inp.timeoutMs) && inp.timeoutMs! > 0 && inp.timeoutMs! <= MAX_CACHE_REFRESH_TIMEOUT_MS
         ? inp.timeoutMs! : DEFAULT_CACHE_REFRESH_TIMEOUT_MS;
-    const headers = Object.fromEntries(Object.entries(inp.headers).filter(([k]) => !/^(content-length|transfer-encoding|connection)$/i.test(k)));
+    const directSse = isWsLaneTransport(currentFetchTransport()) && inp.refreshWebSocketViaSse === true;
+    if (directSse) {
+        const warm = JSON.parse(body) as Json;
+        delete warm.type;
+        delete warm.previous_response_id;
+        delete warm.generate;
+        delete warm.background;
+        delete warm.stream_id;
+        warm.stream = true;
+        body = JSON.stringify(warm);
+    }
+    const effectiveHeaders = directSse ? currentWsDirectHeaders(inp.url, inp.headers) : inp.headers;
+    const headers = Object.fromEntries(Object.entries(effectiveHeaders).filter(([k]) => !(directSse ? /^(content-length|transfer-encoding|connection|upgrade|sec-websocket-.+)$/i : /^(content-length|transfer-encoding|connection)$/i).test(k)));
+    if (directSse) headers.accept = "text/event-stream";
     const controller = new AbortController();
     const signal = inp.signal ? AbortSignal.any([inp.signal, controller.signal]) : controller.signal;
     const deadline = setTimeout(() => controller.abort(), timeoutMs);
@@ -330,7 +350,7 @@ async function sendRefresh(inp: PrefixRefreshInput, body: string): Promise<void>
             if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true });
         });
         const work = async () => {
-            const result = await fetchWithTimeout(inp.url, { method: "POST", headers, body, dispatcher: inp.dispatcher, redirect: "error" }, timeoutMs, signal);
+            const result = await fetchWithTimeout(inp.url, { method: "POST", headers, body, dispatcher: inp.dispatcher, redirect: "error" }, timeoutMs, signal, directSse);
             cleanup = result.clearTimer;
             if (signal.aborted) { cleanup(); void result.response.body?.cancel().catch(() => undefined); throw new Error("refresh aborted"); }
             status = result.response.status;

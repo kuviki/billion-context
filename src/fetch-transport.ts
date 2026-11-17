@@ -5,6 +5,13 @@ type FetchTransport = (url: string, options: FetchOptions) => Promise<Response>;
 
 const transports = new AsyncLocalStorage<FetchTransport>();
 
+const wsDirectHeaders = new WeakMap<FetchTransport, (url: string, headers: Record<string, string>) => Record<string, string>>();
+
+export function currentWsDirectHeaders(url: string, headers: Record<string, string>): Record<string, string> {
+    const transport = currentFetchTransport();
+    return (transport && wsDirectHeaders.get(transport))?.(url, headers) ?? headers;
+}
+
 /** Transports tagged as the Responses-WS lane (#3701 Finding 1). The egress
  * shed byte budget may only trim requests that actually ride a WebSocket:
  * the close-1009 oversize verdict was observed exclusively there. Managed
@@ -13,8 +20,9 @@ const transports = new AsyncLocalStorage<FetchTransport>();
 const wsLaneTransports = new WeakSet<FetchTransport>();
 
 /** Tag a transport (and return it) as the Responses-WS lane. */
-export function markWsLaneTransport(transport: FetchTransport): FetchTransport {
+export function markWsLaneTransport(transport: FetchTransport, directHeaders?: (url: string, headers: Record<string, string>) => Record<string, string>): FetchTransport {
     wsLaneTransports.add(transport);
+    if (directHeaders) wsDirectHeaders.set(transport, directHeaders);
     return transport;
 }
 

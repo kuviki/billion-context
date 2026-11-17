@@ -290,6 +290,8 @@ export interface LoopCtx {
 
 export interface RequestOptions {
     refreshAfterCompress?: boolean;
+    refreshWebSocketViaSse?: boolean;
+    prefixRefreshIncompleteHistory?: boolean;
     refreshTimeoutMs?: number;
     prefixRefreshUnsupportedReason?: string;
     url: string;
@@ -688,6 +690,8 @@ export async function* runCompressLoop(
         const acceptPrefixSnapshot = await beforeCachePrefixRefresh({
             session: ctx.session, enabled: requestOptions.refreshAfterCompress === true,
             timeoutMs: requestOptions.refreshTimeoutMs,
+            refreshWebSocketViaSse: requestOptions.refreshWebSocketViaSse,
+            incompleteHistory: requestOptions.prefixRefreshIncompleteHistory,
             protocol: ctx.protocol, body: wireBodyStr, url: requestOptions.url,
             headers: requestOptions.headers, dispatcher: ctx.proxyUrl ? proxyDispatcher(ctx.proxyUrl) : undefined,
             signal, unsupportedReason: requestOptions.prefixRefreshUnsupportedReason,

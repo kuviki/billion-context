@@ -13,6 +13,7 @@ import { setLogCapture } from "../src/logger.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { peekSession } from "../src/session.ts";
+import { noteCompressionForPrefixRefresh } from "../src/cache-prefix-refresh.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { validateCodexResponsesWsCreate } from "./wire-contract-fakes.ts";
 
@@ -30,7 +31,7 @@ const user = (text: string): Item => ({ type: "message", role: "user", content: 
 // headers (no plugin marker), and every request is a full `response.create`
 // replay — a `generate: false` probe with empty input first, then one
 // full-history frame per turn. Codex never sends previous_response_id.
-async function fixture() {
+async function fixture(refreshWebSocketViaSse = false, warmFailure?: "error" | "timeout") {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-ws-"));
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -39,7 +40,18 @@ async function fixture() {
     let httpRequests = 0;
     let serial = 0;
     let toolArguments: string | undefined;
-    const upstream = http.createServer((req, res) => { if (req.method === "POST") httpRequests++; res.writeHead(404).end(); });
+    const httpRows: Array<{ request: Item; headers: http.IncomingHttpHeaders }> = [];
+    const upstream = http.createServer(async (req, res) => {
+        if (req.method !== "POST") { res.writeHead(404).end(); return; }
+        httpRequests++;
+        if (!refreshWebSocketViaSse) { res.writeHead(404).end(); return; }
+        let body = ""; for await (const chunk of req) body += chunk;
+        httpRows.push({ request: JSON.parse(body), headers: req.headers });
+        if (warmFailure === "timeout") return;
+        if (warmFailure === "error") { res.writeHead(503, { connection: "close" }).end(); return; }
+        res.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
+        res.end(`data: ${JSON.stringify({ type: "response.completed", response: { id: "warm_only", status: "completed", output: [] } })}\n\n`);
+    });
     const wss = new WebSocketServer({ server: upstream });
     wss.on("connection", (peer, req) => { upstreamConnections.push(req.headers); peer.on("error", e => console.error("[FAKE-UPSTREAM-PEER-ERR]", e.message)); peer.on("message", raw => {
         const request = JSON.parse(raw.toString()) as Item;
@@ -74,6 +86,7 @@ async function fixture() {
     const config = defaultConfig(200000);
     config.preserveRecentTokens = 0;
     const opts: ProxyOptions = { host: "127.0.0.1", port: 0, upstream: "http://127.0.0.1", routes: {}, modelContextLimit: 200000, kernelConfig: config, compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: true, logFile: path.join(tmp, "bili.log"), debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } };
+    if (refreshWebSocketViaSse) opts.routes = { [`http://127.0.0.1:${(upstream.address() as { port: number }).port}`]: { cacheKeepalive: { refreshAfterCompress: true, refreshWebSocketViaSse: true, refreshTimeoutMs: 100 }, models: {} } };
     const proxy = await startServer(opts);
     await once(proxy, "listening");
     const proxyOrigin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
@@ -111,7 +124,7 @@ async function fixture() {
     const turn = (input: Item[], client: WebSocket = peer): Promise<Item[]> => exchange(frame(input), client);
     const peer = await openPeer();
     peer.on("error", e => console.error("[TEST-CLIENT-ERR]", e.message));
-    return { rows, upstreamConnections, sid, proxyOrigin, upstreamOrigin, proxy, peer, turn, probe, frame, openPeer,
+    return { rows, httpRows, upstreamConnections, sid, proxyOrigin, upstreamOrigin, proxy, peer, turn, probe, frame, openPeer,
         logPath: path.join(tmp, "bili.log"),
         setToolArguments: (args: string) => { toolArguments = args; }, get httpRequests() { return httpRequests; }, close: async () => {
         peer.terminate();
@@ -436,5 +449,33 @@ test("codex WS: rejection names the offending transport option in the frame and 
             await new Promise(r => setTimeout(r, 20));
         }
         assert.match(log, want);
+    } finally { await f.close(); }
+});
+
+for (const failure of [undefined, "error", "timeout"] as const) test(`codex WS: SSE refresh leaves formal socket intact (${failure ?? "success"})`, { timeout: 30000 }, async () => {
+    const f = await fixture(true, failure);
+    try {
+        completed(await f.turn([user("stable prefix"), user("old tail")]));
+        const session = peekSession(f.sid); assert(session);
+        noteCompressionForPrefixRefresh(session);
+        completed(await f.turn([user("stable prefix"), user("folded tail")]));
+        assert.equal(f.rows.length, 2);
+        assert.equal(f.httpRows.length, 1);
+        assert.equal(f.upstreamConnections.length, 1);
+        const warm = f.httpRows[0];
+        const formal = f.rows[1].request;
+        assert.equal(warm.request.stream, true);
+        assert.equal(warm.request.max_output_tokens, 16);
+        assert.equal(warm.request.type, undefined);
+        assert.equal(warm.request.previous_response_id, undefined);
+        assert.equal(warm.request.tool_choice, formal.tool_choice);
+        assert.deepEqual(warm.request.input, (formal.input as Item[]).slice(0, (warm.request.input as Item[]).length));
+        assert.equal(warm.headers.authorization, f.rows[1].headers.authorization);
+        assert.equal(warm.headers.accept, "text/event-stream");
+        assert.equal(warm.headers["sec-websocket-key"], undefined);
+        completed(await f.turn([user("stable prefix"), user("folded tail"), user("next turn")]));
+        assert.equal(f.rows.length, 3);
+        assert.equal(f.httpRows.length, 1);
+        assert.equal(f.upstreamConnections.length, 1);
     } finally { await f.close(); }
 });

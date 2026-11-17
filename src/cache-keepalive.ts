@@ -96,6 +96,14 @@ export function resolveCacheRefreshAfterCompress(routes: ProviderRoutes | undefi
     return (modelValue ?? providerValue ?? globalValue) === true;
 }
 
+export function resolveCacheRefreshWebSocketViaSse(routes: ProviderRoutes | undefined, upstreamUrl: string | undefined, model?: string): boolean {
+    const route = routes ? findRoute(routes, upstreamUrl) : undefined;
+    const modelValue = resolveModelEntryOnRoute(route, model).entry?.cacheKeepalive?.refreshWebSocketViaSse;
+    const providerValue = route?.cacheKeepalive?.refreshWebSocketViaSse;
+    const globalValue = loadConfigFile().cacheKeepalive?.refreshWebSocketViaSse;
+    return (modelValue ?? providerValue ?? globalValue) === true;
+}
+
 export function resolveCacheRefreshTimeoutMs(routes: ProviderRoutes | undefined, upstreamUrl: string | undefined, model?: string): number {
     const route = routes ? findRoute(routes, upstreamUrl) : undefined;
     const values = [

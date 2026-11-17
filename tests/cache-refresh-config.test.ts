@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, beforeEach, test } from "node:test";
 import { DEFAULT_CACHE_REFRESH_TIMEOUT_MS, MAX_CACHE_REFRESH_TIMEOUT_MS, loadConfigFile, parseCacheKeepaliveSettings, parseRouteEntry, type ProviderRoutes } from "../src/config.ts";
-import { resolveCacheKeepalive, resolveCacheRefreshAfterCompress, resolveCacheRefreshTimeoutMs } from "../src/cache-keepalive.ts";
+import { resolveCacheKeepalive, resolveCacheRefreshAfterCompress, resolveCacheRefreshWebSocketViaSse, resolveCacheRefreshTimeoutMs } from "../src/cache-keepalive.ts";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-refresh-config-"));
 const configPath = path.join(root, "config.json");
@@ -119,4 +119,18 @@ test("refresh deadline rejects zero, negative, fractional, non-finite and malfor
         fs.writeFileSync(configPath, JSON.stringify({ cacheKeepalive: { refreshTimeoutMs } }));
         assert.throws(() => resolveCacheRefreshTimeoutMs(undefined, undefined), /refreshTimeoutMs must be an integer/);
     }
+});
+
+for (const value of [false, true]) test(`WS SSE refresh config resolves ${value} without enabling base feature`, () => {
+    assert.equal(resolveCacheRefreshWebSocketViaSse(undefined, undefined), false);
+    const settings = { refreshWebSocketViaSse: value };
+    assert.deepEqual(parseCacheKeepaliveSettings(settings), settings);
+    fs.writeFileSync(configPath, JSON.stringify({ cacheKeepalive: settings }));
+    assert.equal(resolveCacheRefreshWebSocketViaSse(undefined, undefined), value);
+    assert.equal(resolveCacheRefreshAfterCompress(undefined, undefined), false);
+    const routes: ProviderRoutes = { "https://refresh.test": { cacheKeepalive: { refreshWebSocketViaSse: !value }, models: { one: { cacheKeepalive: settings } } } };
+    assert.equal(resolveCacheRefreshWebSocketViaSse(routes, url, "one"), value);
+    assert.equal(resolveCacheRefreshWebSocketViaSse(routes, url, "other"), !value);
+    assert.equal(resolveCacheRefreshWebSocketViaSse(routes, "https://other.test"), value);
+    for (const invalid of [1, "true", null, {}, []]) assert.throws(() => parseCacheKeepaliveSettings({ refreshWebSocketViaSse: invalid }), /must be a boolean/);
 });

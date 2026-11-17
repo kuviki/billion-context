@@ -1218,3 +1218,35 @@ test("known malformed groups, explicit in-progress and replay commands remain ba
         assert.deepEqual(JSON.parse(buildPrefixRefreshBody(old, current, "responses").body!).input, A, JSON.stringify(barrier));
     }
 });
+
+for (const failure of ["ok", "timeout", "disconnect"] as const) test(`WS opt-in uses direct SSE and fails open: ${failure}`, async () => {
+    mode = failure;
+    const overrides: Partial<PrefixRefreshInput> = { protocol: "responses", refreshWebSocketViaSse: true, timeoutMs: 80 };
+    const old = { model: "plain", input: [...A, ...B], tool_choice: "auto", type: "response.create", stream: false, generate: true };
+    const current = { ...old, input: [...A, ...C] };
+    await withFetchTransport(markWsLaneTransport(async () => { throw new Error("must never touch WS"); }), async () => {
+        const s = session(); await prime(s, old, overrides); await warm(s, current, overrides);
+    });
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0].body.input, A);
+    assert.equal(requests[0].body.stream, true);
+    assert.equal(requests[0].body.tool_choice, "auto");
+    assert.equal(requests[0].body.type, undefined);
+    assert.equal(requests[0].body.generate, undefined);
+    assert.equal(requests[0].headers.accept, "text/event-stream");
+    if (failure !== "ok") assert(logs.some(x => x.includes("retry=0") && x.includes("continuing main request")));
+});
+
+test("WS incomplete snapshots and client probes cannot become a later full baseline", async () => {
+    const options: Partial<PrefixRefreshInput> = { protocol: "responses", refreshWebSocketViaSse: true };
+    const old = { model: "plain", input: [...A, ...B] };
+    const current = { model: "plain", input: [...A, ...C] };
+    await withFetchTransport(markWsLaneTransport(async () => { throw new Error("must never touch WS"); }), async () => {
+        for (const extra of [{ incompleteHistory: true }, { body: JSON.stringify({ ...old, previous_response_id: "unknown-checkpoint" }) }, { body: JSON.stringify({ ...old, generate: false }) }, { body: JSON.stringify({ ...old, prompt_cache_options: { prewarm: true } }) }]) {
+            const s = session(); await prime(s, old, { ...options, ...extra }); await warm(s, current, options);
+        }
+        const s = session(); await prime(s, old, options); await warm(s, current, { ...options, incompleteHistory: true });
+        await warm(s, current, options);
+    });
+    assert.equal(requests.length, 0);
+});

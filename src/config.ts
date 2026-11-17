@@ -165,6 +165,8 @@ export interface CacheKeepaliveSettings {
     enabled?: boolean;
     /** One prefix-only request before the first post-compression send. Default false; independent of the idle timer. */
     refreshAfterCompress?: boolean;
+    /** Also refresh a full Responses WebSocket request over independent SSE. Default off. */
+    refreshWebSocketViaSse?: boolean;
     /** Prefix refresh deadline in ms, integer 1..120000. Default 10000; early completion proceeds immediately. */
     refreshTimeoutMs?: number;
     /** Cadence factor applied to the TTL tier (default 0.9 → 5m tier pings
@@ -3186,7 +3188,7 @@ export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; ma
 // THROWS (config-load failure) instead of being silently dropped, so a
 // typo'd keepalive config can't leave the user wondering why idle sessions
 // cold-rebuild every time.
-const CACHE_KEEPALIVE_FIELDS = ["enabled", "refreshAfterCompress", "refreshTimeoutMs", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
+const CACHE_KEEPALIVE_FIELDS = ["enabled", "refreshAfterCompress", "refreshWebSocketViaSse", "refreshTimeoutMs", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
 
 export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings | undefined {
     if (v === undefined) return undefined;
@@ -3198,7 +3200,7 @@ export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings 
             throw new Error(`[acp-config] cacheKeepalive has unknown key "${key}" (allowed: ${CACHE_KEEPALIVE_FIELDS.join(", ")})`);
     }
     const out: CacheKeepaliveSettings = {};
-    for (const key of ["enabled", "refreshAfterCompress"] as const) {
+    for (const key of ["enabled", "refreshAfterCompress", "refreshWebSocketViaSse"] as const) {
         if (key in obj) {
             if (typeof obj[key] !== "boolean")
                 throw new Error(`[acp-config] cacheKeepalive.${key} must be a boolean (got ${JSON.stringify(obj[key])})`);

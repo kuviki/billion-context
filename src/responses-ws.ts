@@ -405,6 +405,16 @@ export class ResponsesWsUpstream {
         return socket;
     }
 
+    /** Pure header preparation shared by HTTP fallback and cache refresh; no socket/history access. */
+    directHttpHeaders(url: string, rawHeaders: FetchOptions["headers"]): Record<string, string> {
+        const stamped = Object.fromEntries(new Headers(rawHeaders).entries());
+        if (this.hopStamp !== undefined && !Object.keys(stamped).includes(BILI_HOP_HEADER)) stamped[BILI_HOP_HEADER] = this.hopStamp;
+        stamped[BILI_TUNNEL_HEADER] = "1";
+        const headers = finalizeResponsesWsUpstreamHeaders(url, stamped);
+        headers["content-type"] = "application/json";
+        return headers;
+    }
+
     // #3342: plain-HTTP /responses+SSE egress for a supplier that refused the WS
     // upgrade. Sends the FULL expanded effective input (minus previous_response_id
     // and the WS-only `type` field — a fresh connection shares no checkpoint, so a
@@ -413,11 +423,7 @@ export class ResponsesWsUpstream {
     // exactly like the non-WS codex lane (2xx→drainSse→WS frames, non-2xx verbatim);
     // cancellation rides the same abort signal the WS leg honors.
     private async egressHttp(url: string, options: FetchOptions, body: JsonObject, egressTransportFields: JsonObject): Promise<Response> {
-        const stamped = Object.fromEntries(new Headers(options.headers).entries());
-        if (this.hopStamp !== undefined && !Object.keys(stamped).includes(BILI_HOP_HEADER)) stamped[BILI_HOP_HEADER] = this.hopStamp;
-        stamped[BILI_TUNNEL_HEADER] = "1";
-        const headers = finalizeResponsesWsUpstreamHeaders(url, stamped);
-        headers["content-type"] = "application/json";
+        const headers = this.directHttpHeaders(url, options.headers);
         // The WS lane streams because the connection is inherently streaming;
         // plain HTTP has no such default, so force stream:true or the supplier
         // answers a single JSON body that the SSE-only sink would mislabel as an
@@ -938,7 +944,7 @@ export class ResponsesWsSession implements WsBridgeSession {
         this.active = res;
         // markWsLaneTransport (#3701 Finding 1): the egress-shed byte budget keys on
         // this tag — managed HTTP transports (dsh-inline) stay out of the shed.
-        void withFetchTransport(markWsLaneTransport((url, options) => this.transport.fetch(url, options)), async () => {
+        void withFetchTransport(markWsLaneTransport((url, options) => this.transport.fetch(url, options), (url, headers) => this.transport.directHttpHeaders(url, headers)), async () => {
             try {
                 await this.context.dispatch(req, res);
                 if (res.response) {

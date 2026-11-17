@@ -485,6 +485,13 @@ entries:
     desc_en: "Send the longest unchanged legal prefix once before the first post-compression request; preserve reasoning effort and stream settings. Anthropic/Chat cap output at 1 token; plain Responses at 16. Independent of idle enabled; model > provider > global. Unsupported shapes skip; failures continue the real request without retry. Extra usage may be billed."
     desc_zh: "压缩后首次请求前，单独请求一次最长的未变化且协议合法的前缀；保留 reasoning effort 和流式设置。Anthropic/Chat 输出上限 1 token，普通 Responses 为 16。独立于空闲保活 enabled；模型 > provider > 全局。不支持的形状跳过，失败不重试并继续正式请求；额外用量可能计费。"
     desc_ja: "圧縮後最初のリクエスト前に、不変で有効な最長プレフィックスを一度送信。reasoning effort とストリーム設定を保持。Anthropic/Chat の出力上限は1トークン、通常の Responses は16。アイドル enabled とは独立。モデル > プロバイダ > 全体。未対応形式はスキップし、失敗しても再試行せず本来のリクエストを続行。追加料金が発生する場合がある。"
+  - key: cacheKeepalive.refreshWebSocketViaSse
+    type: boolean
+    default: "false"
+    group: behavior
+    desc_en: "Opt in to SSE-only prefix refresh for full Responses WebSocket requests; also requires refreshAfterCompress. Model > provider > global. Sends one same-route HTTP POST with stream=true, without opening or touching the formal WebSocket. Anchored deltas, client prewarm actions and unsupported output-cap endpoints skip. Timeout/failure continues the formal request without retry. Extra usage may be billed; cross-transport cache sharing is not guaranteed."
+    desc_zh: "为完整 Responses WebSocket 请求启用仅走 SSE 的前缀预热，同时须开启 refreshAfterCompress；模型 > provider > 全局。向相同路由发送一次 stream=true 的 HTTP POST，不新建或操作正式 WebSocket。锚定增量、客户端预热动作及不支持输出上限的端点跳过；超时或失败不重试并继续正式请求。可能产生额外费用，不保证跨传输缓存共享。"
+    desc_ja: "完全な Responses WebSocket リクエストのプレフィックスを SSE のみで更新。refreshAfterCompress も必要。モデル > プロバイダ > 全体。同じルートへ stream=true の HTTP POST を一度送り、正式な WebSocket は開設・操作しない。アンカー付き差分、クライアントの予熱操作、出力上限非対応エンドポイントはスキップ。失敗・タイムアウトでも再試行せず続行。追加料金が発生する場合があり、通信方式間のキャッシュ共有は保証されない。"
   - key: cacheKeepalive.refreshTimeoutMs
     type: number
     default: "10000"
