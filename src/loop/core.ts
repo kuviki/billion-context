@@ -293,6 +293,7 @@ export interface RequestOptions {
     refreshWebSocketViaSse?: boolean;
     prefixRefreshIncompleteHistory?: boolean;
     refreshTimeoutMs?: number;
+    refreshDelayMs?: number;
     prefixRefreshUnsupportedReason?: string;
     url: string;
     /** Exact request model when this wire carries it in a URL/envelope instead of the body. */
@@ -690,6 +691,7 @@ export async function* runCompressLoop(
         const acceptPrefixSnapshot = await beforeCachePrefixRefresh({
             session: ctx.session, enabled: requestOptions.refreshAfterCompress === true,
             timeoutMs: requestOptions.refreshTimeoutMs,
+            delayMs: requestOptions.refreshDelayMs,
             refreshWebSocketViaSse: requestOptions.refreshWebSocketViaSse,
             incompleteHistory: requestOptions.prefixRefreshIncompleteHistory,
             protocol: ctx.protocol, body: wireBodyStr, url: requestOptions.url,

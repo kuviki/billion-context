@@ -13,7 +13,7 @@ import { type CompressionCore, type Config, type CoreMessage, buildBlockOpsSyste
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
-import { beforeCachePrefixRefresh } from "../cache-prefix-refresh.js";
+import { beforeCachePrefixRefresh, resolveCacheRefreshDelayMs } from "../cache-prefix-refresh.js";
 import { resolveCacheRefreshAfterCompress, resolveCacheRefreshWebSocketViaSse, resolveCacheRefreshTimeoutMs, noteSuccessfulForward } from "../cache-keepalive.js";
 import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
@@ -1272,6 +1272,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     const refreshAfterCompress = resolveCacheRefreshAfterCompress(opts.routes, upstreamUrl, throttleModel);
     const refreshWebSocketViaSse = resolveCacheRefreshWebSocketViaSse(opts.routes, upstreamUrl, throttleModel);
     const prefixRefreshIncompleteHistory = wsAnchoredPayload(req) !== undefined;
+    const refreshDelayMs = resolveCacheRefreshDelayMs(opts.routes, upstreamUrl, throttleModel);
     const refreshTimeoutMs = resolveCacheRefreshTimeoutMs(opts.routes, upstreamUrl, throttleModel);
     const prefixRefreshUnsupportedReason = resignCtx !== undefined ? "request-signature-required"
         : v1Active ? "enveloped-v1-wire" : prepared?.threadsLane === true ? "server-threads-lane"
@@ -1280,7 +1281,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     const acceptPrefixSnapshot = mainSend && prepared
         ? await beforeCachePrefixRefresh({
             session: prepared.session, enabled: refreshAfterCompress,
-            timeoutMs: refreshTimeoutMs, refreshWebSocketViaSse, incompleteHistory: prefixRefreshIncompleteHistory,
+            timeoutMs: refreshTimeoutMs, delayMs: refreshDelayMs, refreshWebSocketViaSse, incompleteHistory: prefixRefreshIncompleteHistory,
             protocol: prepared.protocol, body: wireBody, url: upstreamUrl, headers, dispatcher,
             signal: clientAbort.signal, unsupportedReason: prefixRefreshUnsupportedReason,
         })
@@ -2792,7 +2793,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
                 // single adoption point or parseStream sees no candidates.
-                { url: upstreamUrl, headers: reqHeaders, model: throttleModel, refreshAfterCompress, refreshWebSocketViaSse, prefixRefreshIncompleteHistory, refreshTimeoutMs, prefixRefreshUnsupportedReason, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", reqHeaders), responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
+                { url: upstreamUrl, headers: reqHeaders, model: throttleModel, refreshAfterCompress, refreshWebSocketViaSse, prefixRefreshIncompleteHistory, refreshTimeoutMs, refreshDelayMs, prefixRefreshUnsupportedReason, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", reqHeaders), responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,

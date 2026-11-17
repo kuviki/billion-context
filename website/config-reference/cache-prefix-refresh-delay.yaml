@@ -1,0 +1,9 @@
+domain: cache-prefix-refresh-delay
+entries:
+  - key: cacheKeepalive.refreshDelayMs
+    type: number
+    default: "0"
+    group: behavior
+    desc_en: "Wait once before a realized post-compression send, before warm-up if eligible or otherwise before the formal request, even when refreshAfterCompress is disabled. Integer 0..120000 ms; model > provider > global. Ordinary appended requests do not wait. Requires a prior comparable full history; incomplete, oversized or unparseable histories defer the check. Independent of warm-up timeout; cancellation interrupts waiting and preserves the pending delay for the next actual send."
+    desc_zh: "确认压缩已体现在出站历史后仅等待一次，有预热则在预热前等，否则在正式请求前等，即使 refreshAfterCompress 关闭也生效。整数 0..120000 毫秒；模型 > provider > 全局。普通追加请求不等。须有此前可比较的完整历史；增量、过大或不可解析历史延后判断。独立于预热超时；取消可中断等待，并将尚未发送的等待保留至下次实际发送。"
+    desc_ja: "圧縮が送信履歴に反映された時に一度待機。予熱があればその前、なければ正式送信前で、refreshAfterCompress が無効でも適用。整数0..120000ミリ秒、モデル > プロバイダ > 全体。追記のみは待たない。比較可能な完全履歴が必要で、不完全・過大・解析不能な履歴では判定を保留。予熱タイムアウトとは独立。キャンセルで待機を中断し、未送信の待機は次の実際の送信まで保持。"

@@ -1250,3 +1250,90 @@ test("WS incomplete snapshots and client probes cannot become a later full basel
     });
     assert.equal(requests.length, 0);
 });
+
+for (const enabled of [false, true]) test(`post-fold delay precedes warm/formal exactly once (warm=${enabled})`, async () => {
+    const s = session(); const opts = { enabled, delayMs: 50 };
+    await prime(s, beforeBody, opts);
+    // Ordinary appended requests without a successful fold are never delayed.
+    await prime(s, body([...A, ...B, { role: "user", content: "ordinary append" }]), opts);
+    assert(!logs.some(x => x.includes("delay configuredMs")));
+    noteCompressionForPrefixRefresh(s);
+    // Successful fold has not materialized yet (e.g. failed refreshFolded).
+    await prime(s, body([...A, ...B, { role: "user", content: "ordinary append" }, { role: "assistant", content: "intermediate" }]), opts);
+    assert(!logs.some(x => x.includes("delay configuredMs")));
+    const start = Date.now();
+    await Promise.all([prime(s, afterBody, opts), prime(s, afterBody, opts)]);
+    assert(Date.now() - start >= 40);
+    assert.equal(logs.filter(x => x.includes("delay configuredMs=50")).length, 1);
+    assert(logs.some(x => x.includes(`phase=${enabled ? "warm" : "formal"}`)));
+    assert.equal(requests.length, enabled ? 1 : 0);
+    // A retry is not a new fold.
+    await prime(s, afterBody, opts);
+    assert.equal(logs.filter(x => x.includes("delay configuredMs")).length, 1);
+});
+
+test("delay waits even without a legal prefix; route-only append does not spend it", async () => {
+    const s = session(); const opts = { delayMs: 35 };
+    await prime(s, beforeBody, opts); noteCompressionForPrefixRefresh(s);
+    const other = url + "?route=other";
+    await prime(s, body([...A, ...B, { role: "user", content: "append" }]), { ...opts, url: other });
+    assert(!logs.some(x => x.includes("delay configuredMs")));
+    await prime(s, body([{ role: "user", content: "fully replaced" }]), { ...opts, url: other });
+    assert.equal(requests.length, 0);
+    assert.equal(logs.filter(x => x.includes("delay configuredMs=35") && x.includes("phase=formal")).length, 1);
+});
+
+test("delay aborts promptly, suppresses warm, and preserves marker for the next actual send", async () => {
+    const s = session(); const controller = new AbortController();
+    const opts = { delayMs: 1000, signal: controller.signal };
+    await prime(s, beforeBody, opts); noteCompressionForPrefixRefresh(s);
+    const start = Date.now(); const wait = prime(s, afterBody, opts);
+    setTimeout(() => controller.abort(), 25); await wait;
+    assert(Date.now() - start < 500);
+    assert.equal(requests.length, 0);
+    assert(logs.some(x => x.includes("delay configuredMs=1000") && x.includes("aborted=true")));
+    await prime(s, afterBody, { delayMs: 30 });
+    assert.equal(logs.filter(x => x.includes("delay configuredMs")).length, 2);
+    assert.equal(requests.length, 1);
+});
+
+test("unproven snapshots retain delay marker until a comparable full history arrives", async () => {
+    const s = session(); const opts = { enabled: false, delayMs: 30 };
+    await prime(s, beforeBody, opts); noteCompressionForPrefixRefresh(s);
+    await prime(s, afterBody, { ...opts, body: "not JSON" });
+    await prime(s, afterBody, { ...opts, body: "x".repeat(8 * 1024 * 1024 + 1) });
+    assert(!logs.some(x => x.includes("delay configuredMs")));
+    await prime(s, afterBody, opts);
+    assert.equal(logs.filter(x => x.includes("delay configuredMs=30")).length, 1);
+});
+
+test("zero delay and no fold never schedule delay or warm", async () => {
+    const s = session(); await prime(s, beforeBody, { enabled: false, delayMs: 0 });
+    noteCompressionForPrefixRefresh(s); await prime(s, afterBody, { enabled: false, delayMs: 0 });
+    assert(!logs.some(x => x.includes("delay configuredMs"))); assert.equal(requests.length, 0);
+});
+
+test("a queued cancellation stops waiting without cancelling another request's delay", async () => {
+    const s = session(); const opts = { enabled: false, delayMs: 100 };
+    await prime(s, beforeBody, opts); noteCompressionForPrefixRefresh(s);
+    const first = prime(s, afterBody, opts);
+    const controller = new AbortController();
+    const start = Date.now();
+    const queued = prime(s, afterBody, { ...opts, signal: controller.signal });
+    controller.abort(); await queued;
+    assert(Date.now() - start < 70);
+    await first;
+    assert.equal(logs.filter(x => x.includes("delay configuredMs=100")).length, 1);
+});
+
+test("incomplete WS tail does not consume the pending delay", async () => {
+    await withFetchTransport(markWsLaneTransport(async () => { throw new Error("no WS warm"); }), async () => {
+        const s = session(); const opts: Partial<PrefixRefreshInput> = { enabled: false, delayMs: 30, protocol: "responses" };
+        const previous = { model: "plain", input: [...A, ...B] }, current = { model: "plain", input: [...A, ...C] };
+        await prime(s, previous, opts); noteCompressionForPrefixRefresh(s);
+        await prime(s, current, { ...opts, incompleteHistory: true });
+        assert(!logs.some(x => x.includes("delay configuredMs")));
+        await prime(s, current, opts);
+        assert.equal(logs.filter(x => x.includes("delay configuredMs=30") && x.includes("phase=formal")).length, 1);
+    });
+});

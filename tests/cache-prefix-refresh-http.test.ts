@@ -21,8 +21,8 @@ async function close(server: http.Server): Promise<void> {
     await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
-for (const protocol of ["openai", "anthropic"] as const) for (const stream of [false, true]) for (const search of [false, true]) {
-    test(`real ${protocol} stream=${stream} search=${search} relay runs provider-enabled prefix refresh before main and isolates usage`, { timeout: 20_000 }, async () => {
+for (const protocol of ["openai", "anthropic"] as const) for (const stream of [false, true]) for (const search of [false, true]) for (const warmEnabled of [true, false]) {
+    test(`real ${protocol} stream=${stream} search=${search} relay delay with warm=${warmEnabled} runs before main and isolates usage`, { timeout: 20_000 }, async () => {
         _resetPrefixRefreshForTest();
         _setStoreForTest(new SessionStore({ enabled: false }));
         setRegistryForTest({});
@@ -62,7 +62,7 @@ for (const protocol of ["openai", "anthropic"] as const) for (const stream of [f
         const origin = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
         const opts: ProxyOptions = {
             port: 0, host: "127.0.0.1", upstream: origin,
-            routes: { [origin]: { models: { "plain-test": { context: 400_000, ...(protocol === "openai" ? { cacheKeepalive: { refreshTimeoutMs: 700 } } : {}) } }, cacheKeepalive: { refreshAfterCompress: true, refreshTimeoutMs: 900 } } },
+            routes: { [origin]: { models: { "plain-test": { context: 400_000, ...(protocol === "openai" ? { cacheKeepalive: { refreshTimeoutMs: 700, refreshDelayMs: 25 } } : {}) } }, cacheKeepalive: { refreshAfterCompress: warmEnabled, refreshTimeoutMs: 900, refreshDelayMs: 35 } } },
             modelContextLimit: 400_000, kernelConfig: defaultConfig(400_000),
             compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" },
             sessionHeader: "x-acp-session", log: false, debug: false,
@@ -72,7 +72,7 @@ for (const protocol of ["openai", "anthropic"] as const) for (const stream of [f
         };
         const proxy = await startServer(opts);
         if (!proxy.listening) await once(proxy, "listening");
-        const sid = `refresh-http-${protocol}-${stream}-${search}`;
+        const sid = `refresh-http-${protocol}-${stream}-${search}-${warmEnabled}`;
         const searchSettings = !search ? {} : protocol === "openai"
             ? { web_search_options: { search_context_size: "low" }, tool_choice: "auto" }
             : { tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }, { name: "client_tool", input_schema: { type: "object", properties: {} } }], tool_choice: { type: "auto" } };
@@ -92,18 +92,27 @@ for (const protocol of ["openai", "anthropic"] as const) for (const stream of [f
             await post("OLD B");
             assert.equal(sent.length, 1);
             noteCompressionForPrefixRefresh(getSession(sid));
+            const started = Date.now();
             await post("NEW C");
-            assert.equal(sent.length, 3, "initial normal, prefix-only warm, post-fold normal");
-            assert.equal(sent[1].max_tokens, 1);
-            const warmLog = logs.find(x => x.includes("[cache-prefix-refresh] success"));
-            assert(warmLog);
-            assert.match(warmLog, new RegExp(`timeoutMs=${refreshTimeoutMs}\\b`), "resolved provider/model timeout reaches the real relay hook");
-            assert.equal(sent[1].stream, stream);
-            assert.deepEqual(sent[1].stream_options, sent[2].stream_options, "preserve stream_options exactly without enabling usage");
-            for (const field of ["web_search_options", "tools", "tool_choice"]) assert.deepEqual(sent[1][field], sent[2][field], `warm keeps final formal ${field}`);
-            assert.match(JSON.stringify(sent[1].messages), /stable first A/);
-            assert.doesNotMatch(JSON.stringify(sent[1].messages), /OLD B|NEW C|stable tail/);
-            assert.match(JSON.stringify(sent[2].messages), /NEW C/);
+            const delayMs = protocol === "openai" ? 25 : 35;
+            assert(Date.now() - started >= delayMs - 5);
+            assert(logs.some(x => x.includes(`delay configuredMs=${delayMs}`) && x.includes(`phase=${warmEnabled ? "warm" : "formal"}`)));
+            if (warmEnabled) {
+                assert.equal(sent.length, 3, "initial normal, prefix-only warm, post-fold normal");
+                assert.equal(sent[1].max_tokens, 1);
+                const warmLog = logs.find(x => x.includes("[cache-prefix-refresh] success"));
+                assert(warmLog);
+                assert.match(warmLog, new RegExp(`timeoutMs=${refreshTimeoutMs}\\b`), "resolved provider/model timeout reaches the real relay hook");
+                assert.equal(sent[1].stream, stream);
+                assert.deepEqual(sent[1].stream_options, sent[2].stream_options, "preserve stream_options exactly without enabling usage");
+                for (const field of ["web_search_options", "tools", "tool_choice"]) assert.deepEqual(sent[1][field], sent[2][field], `warm keeps final formal ${field}`);
+                assert.match(JSON.stringify(sent[1].messages), /stable first A/);
+                assert.doesNotMatch(JSON.stringify(sent[1].messages), /OLD B|NEW C|stable tail/);
+                assert.match(JSON.stringify(sent[2].messages), /NEW C/);
+            } else {
+                assert.equal(sent.length, 2, "delay-only must not send any warm request");
+                assert.match(JSON.stringify(sent[1].messages), /NEW C/);
+            }
             const lines = getCacheLedger(getSession(sid)).lines;
             assert.equal(lines.length, 2, "warm usage must not be inserted into conversation ledger");
             assert(lines.every(line => line.input === 100), "warm's synthetic 999-token usage never poisons main accounting");

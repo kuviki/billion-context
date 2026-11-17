@@ -148,6 +148,8 @@ export type ProviderRoute = {
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
+export const MAX_CACHE_REFRESH_DELAY_MS = 120_000;
+
 export const DEFAULT_CACHE_REFRESH_TIMEOUT_MS = 10_000;
 export const MAX_CACHE_REFRESH_TIMEOUT_MS = 120_000;
 
@@ -169,6 +171,8 @@ export interface CacheKeepaliveSettings {
     refreshWebSocketViaSse?: boolean;
     /** Prefix refresh deadline in ms, integer 1..120000. Default 10000; early completion proceeds immediately. */
     refreshTimeoutMs?: number;
+    /** One delay before a realized post-compression send, independent of warm-up. Default 0. */
+    refreshDelayMs?: number;
     /** Cadence factor applied to the TTL tier (default 0.9 → 5m tier pings
      *  every ~4.5 min, 1h tier every ~54 min). Must be in (0, 1]. */
     ttlFactor?: number;
@@ -3188,7 +3192,7 @@ export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; ma
 // THROWS (config-load failure) instead of being silently dropped, so a
 // typo'd keepalive config can't leave the user wondering why idle sessions
 // cold-rebuild every time.
-const CACHE_KEEPALIVE_FIELDS = ["enabled", "refreshAfterCompress", "refreshWebSocketViaSse", "refreshTimeoutMs", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
+const CACHE_KEEPALIVE_FIELDS = ["enabled", "refreshAfterCompress", "refreshWebSocketViaSse", "refreshTimeoutMs", "refreshDelayMs", "ttlFactor", "maxDurationMs", "maxConcurrentPings", "assumeTtl", "armWithoutBreakpoints", "intervalMs"] as const;
 
 export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings | undefined {
     if (v === undefined) return undefined;
@@ -3206,6 +3210,12 @@ export function parseCacheKeepaliveSettings(v: unknown): CacheKeepaliveSettings 
                 throw new Error(`[acp-config] cacheKeepalive.${key} must be a boolean (got ${JSON.stringify(obj[key])})`);
             out[key] = obj[key];
         }
+    }
+    if ("refreshDelayMs" in obj) {
+        const n = obj.refreshDelayMs;
+        if (typeof n !== "number" || !Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > MAX_CACHE_REFRESH_DELAY_MS)
+            throw new Error(`[acp-config] cacheKeepalive.refreshDelayMs must be an integer in [0, 120000] milliseconds (got ${JSON.stringify(n)})`);
+        out.refreshDelayMs = n;
     }
     if ("refreshTimeoutMs" in obj) {
         const n = obj.refreshTimeoutMs;

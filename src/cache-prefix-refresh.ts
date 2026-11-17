@@ -1,16 +1,29 @@
 import { createHash } from "node:crypto";
 import { credentialFingerprint } from "./cache-ledger.js";
-import { DEFAULT_CACHE_REFRESH_TIMEOUT_MS, MAX_CACHE_REFRESH_TIMEOUT_MS } from "./config.js";
+import { DEFAULT_CACHE_REFRESH_TIMEOUT_MS, MAX_CACHE_REFRESH_TIMEOUT_MS, MAX_CACHE_REFRESH_DELAY_MS, findRoute, loadConfigFile, parseCacheKeepaliveSettings, resolveModelEntryOnRoute, type ProviderRoutes } from "./config.js";
 import { fetchWithTimeout } from "./fetch-util.js";
 import { currentFetchTransport, currentWsDirectHeaders, isWsLaneTransport } from "./fetch-transport.js";
 import { log } from "./logger.js";
 import type { Session } from "./session.js";
 import { usageTotals, type WireProtocol } from "./util.js";
 
+export function resolveCacheRefreshDelayMs(routes: ProviderRoutes | undefined, upstreamUrl: string | undefined, model?: string): number {
+    const route = routes ? findRoute(routes, upstreamUrl) : undefined;
+    const values = [
+        resolveModelEntryOnRoute(route, model).entry?.cacheKeepalive?.refreshDelayMs,
+        route?.cacheKeepalive?.refreshDelayMs,
+        loadConfigFile().cacheKeepalive?.refreshDelayMs,
+    ];
+    for (const value of values) {
+        if (value !== undefined) return parseCacheKeepaliveSettings({ refreshDelayMs: value })!.refreshDelayMs!;
+    }
+    return 0;
+}
+
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 const MAX_REPLY_BYTES = 1024 * 1024;
 type Json = Record<string, unknown>;
-type Snapshot = { body: Json; namespace: string; order: number; skipReason?: string };
+type Snapshot = { protocol: WireProtocol; body: Json; namespace: string; order: number; skipReason?: string };
 type RefreshState = { last?: Snapshot; pending?: Snapshot; active?: Promise<void>; order: number };
 let states = new WeakMap<Session, RefreshState>();
 const obj = (v: unknown): v is Json => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -23,6 +36,7 @@ export interface PrefixRefreshInput {
     /** A WS anchored fast delta is not a proven full standalone history. */
     incompleteHistory?: boolean;
     timeoutMs?: number;
+    delayMs?: number;
     protocol: WireProtocol | undefined;
     body: string | Buffer;
     url: string;
@@ -157,7 +171,7 @@ function parseSnapshot(inp: PrefixRefreshInput): { snapshot?: Snapshot; reason?:
     }
     const tenantHeaders = Object.entries(inp.headers).filter(([k]) => /^(openai-organization|openai-project)$/i.test(k)).map(([k, v]) => [k.toLowerCase(), v]).sort();
     const namespace = createHash("sha256").update(JSON.stringify([inp.url, inp.protocol, body.model, credentialFingerprint(inp.headers), tenantHeaders])).digest("hex");
-    return { snapshot: { body, namespace, order: 0, skipReason: unsupportedReason(inp, body) } };
+    return { snapshot: { protocol: inp.protocol, body, namespace, order: 0, skipReason: unsupportedReason(inp, body) } };
 }
 
 function safeEnds(items: unknown[], protocol: WireProtocol, body: Json): Set<number> {
@@ -396,34 +410,82 @@ function logSkip(inp: PrefixRefreshInput, reason: string): void {
     log("info", `[${inp.session.id}] [cache-prefix-refresh] skipped status=none durationMs=0 http=not-sent api=not-sent cached=unknown total=unknown hit=unknown cacheScope=warm mainHit=unobserved reason=${reason} retry=0`);
 }
 
+/** Unlike a warm-up cutoff, materialization is independent of route and legal
+ * endpoints. Only comparable full histories prove the committed fold is visible. */
+function replacedHistory(previous: Snapshot, current: Snapshot): boolean | undefined {
+    if (previous.protocol !== current.protocol) return undefined;
+    const key = current.protocol === "responses" ? "input" : "messages";
+    const before = previous.body[key], after = current.body[key];
+    if (!Array.isArray(before) || !Array.isArray(after)) return undefined;
+    return before.length > after.length || before.some((item, i) => !equal(item, after[i]));
+}
+
+async function waitForActive(active: Promise<void>, signal?: AbortSignal): Promise<void> {
+    if (!signal) { await active; return; }
+    if (signal.aborted) return;
+    let abort: () => void = () => undefined;
+    const cancelled = new Promise<void>(resolve => { abort = resolve; signal.addEventListener("abort", abort, { once: true }); });
+    try { await Promise.race([active, cancelled]); } finally { signal.removeEventListener("abort", abort); }
+}
+
+async function delayRefresh(inp: PrefixRefreshInput, delayMs: number, phase: "warm" | "formal"): Promise<void> {
+    const start = Date.now();
+    await new Promise<void>(resolve => {
+        if (inp.signal?.aborted) { resolve(); return; }
+        const done = () => { clearTimeout(timer); inp.signal?.removeEventListener("abort", done); resolve(); };
+        const timer = setTimeout(done, delayMs);
+        inp.signal?.addEventListener("abort", done, { once: true });
+    });
+    log("info", `[${inp.session.id}] [cache-prefix-refresh] delay configuredMs=${delayMs} actualMs=${Date.now() - start} phase=${phase} aborted=${inp.signal?.aborted === true}`);
+}
+
 /** Returns a receipt to call only after the MAIN request is accepted. */
 export async function beforeCachePrefixRefresh(inp: PrefixRefreshInput): Promise<() => void> {
     const noop = () => undefined;
-    if (!inp.enabled) { states.delete(inp.session); return noop; }
+    const delayMs = Number.isSafeInteger(inp.delayMs) && inp.delayMs! >= 0 && inp.delayMs! <= MAX_CACHE_REFRESH_DELAY_MS ? inp.delayMs! : 0;
+    if (!inp.enabled && delayMs === 0) { states.delete(inp.session); return noop; }
     try {
         const parsed = parseSnapshot(inp);
         const snapshot = parsed.snapshot;
         if (!snapshot) {
             if (states.get(inp.session)?.pending) logSkip(inp, parsed.reason ?? "unsupported-request");
-            states.delete(inp.session); return noop;
+            // With delay enabled, retain a pre-fold baseline until a full comparable
+            // request can prove materialization. Never infer it from a WS tail.
+            if (delayMs === 0) states.delete(inp.session);
+            return noop;
         }
         const state = states.get(inp.session) ?? { order: 0 };
         states.set(inp.session, state);
         snapshot.order = ++state.order;
-        if (state.active) await state.active;
+        while (state.active) {
+            await waitForActive(state.active, inp.signal);
+            if (inp.signal?.aborted || states.get(inp.session) !== state) return noop;
+        }
         const pending = state.pending;
         if (pending) {
-            const plan = pending.namespace === snapshot.namespace ? buildPrefixRefreshBody(pending.body, snapshot.body, inp.protocol!) : { unchanged: false, reason: "cache-route-identity-changed" };
-            if (!plan.unchanged) {
+            const materialized = replacedHistory(pending, snapshot);
+            const plan = !inp.enabled ? { unchanged: materialized !== true, body: undefined, reason: undefined } : pending.namespace === snapshot.namespace ? buildPrefixRefreshBody(pending.body, snapshot.body, inp.protocol!) : { unchanged: false, reason: "cache-route-identity-changed" };
+            // An append-only intermediate request must not spend the fold marker.
+            // A protocol switch or non-array history cannot prove realization.
+            const ready = delayMs > 0 ? materialized === true : !plan.unchanged;
+            if (ready) {
                 delete state.pending;
                 const reason = snapshot.skipReason ?? plan.reason;
-                if (plan.body && !reason && !inp.signal?.aborted) {
-                    const active = sendRefresh(inp, plan.body);
-                    state.active = active;
-                    try { await active; } finally { if (state.active === active) delete state.active; }
-                } else logSkip(inp, inp.signal?.aborted ? "client-aborted" : reason ?? "no-legal-common-prefix");
-            }
+                const warm = inp.enabled && plan.body !== undefined && !reason;
+                const active = (async () => {
+                    if (delayMs > 0 && !inp.signal?.aborted) await delayRefresh(inp, delayMs, warm ? "warm" : "formal");
+                    if (inp.signal?.aborted) {
+                        // No send has started: cancellation must not spend the delay
+                        // for the next real send, or overwrite a newer fold marker.
+                        if (delayMs > 0 && states.get(inp.session) === state && !state.pending) state.pending = pending;
+                    } else if (warm) await sendRefresh(inp, plan.body!);
+                    else if (inp.enabled) logSkip(inp, inp.signal?.aborted ? "client-aborted" : reason ?? "no-legal-common-prefix");
+                })();
+                state.active = active;
+                try { await active; } finally { if (state.active === active) delete state.active; }
+            } else if (delayMs > 0 && materialized === undefined) logSkip(inp, "delay-materialization-unproven");
         }
+        if (inp.signal?.aborted) return noop;
         return () => {
             if (states.get(inp.session) === state && (!state.last || state.last.order < snapshot.order)) state.last = snapshot;
         };

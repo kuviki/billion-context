@@ -1,3 +1,4 @@
+import { resolveCacheRefreshDelayMs } from "../src/cache-prefix-refresh.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -133,4 +134,17 @@ for (const value of [false, true]) test(`WS SSE refresh config resolves ${value}
     assert.equal(resolveCacheRefreshWebSocketViaSse(routes, url, "other"), !value);
     assert.equal(resolveCacheRefreshWebSocketViaSse(routes, "https://other.test"), value);
     for (const invalid of [1, "true", null, {}, []]) assert.throws(() => parseCacheKeepaliveSettings({ refreshWebSocketViaSse: invalid }), /must be a boolean/);
+});
+
+test("post-fold delay is independently default-zero, bounded, and model > provider > global", () => {
+    assert.equal(resolveCacheRefreshDelayMs(undefined, undefined), 0);
+    fs.writeFileSync(configPath, JSON.stringify({ cacheKeepalive: { refreshDelayMs: 100 } }));
+    assert.equal(resolveCacheRefreshDelayMs(undefined, undefined), 100);
+    assert.equal(resolveCacheRefreshAfterCompress(undefined, undefined), false);
+    const routes: ProviderRoutes = { "https://refresh.test": { cacheKeepalive: { refreshDelayMs: 200 }, models: { one: { cacheKeepalive: { refreshDelayMs: 0 } } } } };
+    assert.equal(resolveCacheRefreshDelayMs(routes, url, "one"), 0);
+    assert.equal(resolveCacheRefreshDelayMs(routes, url, "other"), 200);
+    assert.equal(resolveCacheRefreshDelayMs(routes, "https://other.test"), 100);
+    for (const n of [0, 120000]) assert.deepEqual(parseCacheKeepaliveSettings({ refreshDelayMs: n }), { refreshDelayMs: n });
+    for (const n of [-1, 120001, 1.5, Infinity, NaN, null, "2", true]) assert.throws(() => parseCacheKeepaliveSettings({ refreshDelayMs: n }), /refreshDelayMs/);
 });
