@@ -354,6 +354,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.reasoning.drop` | boolean | true | — | Drop finished-round reasoning runs longer than the threshold. |
 | `compress.reasoning.threshold` | number | 2048 | — | Character threshold above which finished reasoning runs are dropped. |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | Deprecated alias of minCompressRangeChars (accepted, mapped onto it). _(deprecated)_ |
+| `compress.postFoldDelayMs` | integer (milliseconds) | 0 | — | Wait once before sending the first model request that carries a newly applied compression. Accepts 0–120,000 ms; 0 disables it. Configurable globally, per provider, and per model. Sends no prewarm request. |
 
 **Provider route fields**
 

@@ -1,3 +1,4 @@
+import { carriedFoldBlockIds } from "./post-fold-delay.js";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -121,7 +122,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, reconcileDerivedLineage } from 
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { flushOrderSkeletons, hydrateOrderSkeletons } from "./order-persist.js";
 import { setSimhashAdoptionEnabled } from "./prefix-affinity.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, hydratePluginConversationsUnified, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, hydratePluginConversationsUnified, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -2708,87 +2709,9 @@ export function warnResponsesReasoningPairs(
     log("warn", `[${sessionId}] reasoning-pair-violated: ${split} tool-call item(s) in ${runs} assistant run(s) lack any reasoning item while ${withReasoning} exist — strict-echo upstreams will reject the request; first seen: ${violationNamed(tracked.fresh, tracked.ongoing, tracked.maxRepeat)} (#684/#1479/#2864)`);
 }
 
-/** Carrier-evidence index for stripKernelSummaries (#2042).
- *
- *  #1567 hardening: a plugin-fold block's in-place anchor is redundant ONLY
- *  while the client's own compress pair for that exact fold actually rides
- *  the (post-prepare) history. The pair is recognized by tool name plus the
- *  folded range quoted in its call args — flat {startId,endId} or
- *  {content:[{startId,endId}]}, both accepted by the plugin tool API. This
- *  restores the self-verifying carrier handoff a raw prefix strip lost: a
- *  pruned or contract-violating client (pair absent) keeps the anchor, so an
- *  active fold never ends up with zero carriers. It also covers kernel-side
- *  pruning: hideConsumedCompressCalls (KEEP_LAST_ORPHANED) runs in the
- *  pipeline BEFORE this strip, so an older pair already hidden from the wire
- *  is absent here and its anchor correctly survives. Unparseable args count
- *  as no match (anchor kept — fail-safe direction). Blocks predating range
- *  recording (no startRef/endRef) degrade to "any compress call present",
- *  the pre-hardening prefix-strip behavior.
- *
- *  #2042: the evidence is collected in ONE pass over the (post-kernel)
- *  history instead of rescanning it per active block (O(B×N) → O(N+B+R)).
- *  It MUST be rebuilt from THIS history on every call — the kernel may have
- *  pruned earlier pairs since prepare, so no pre-prepare cache may be
- *  reused. Compress-call args are parsed lazily (only when an active plugin
- *  block with recorded refs needs exact matching) and each call's args are
- *  parsed at most ONCE, whereas the old per-block scan reparsed them for
- *  every block. */
-function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureRangePairs: () => Map<string, Set<string>> } {
-    const callIds = new Set<string>();
-    const compressCalls: BiliMessage[] = [];
-    for (const m of messages) {
-        if (m.contentType !== "tool-call") continue;
-        if (m.toolCallId) callIds.add(m.toolCallId);
-        if (m.toolName === COMPRESS_TOOL_NAME) compressCalls.push(m);
-    }
-    let rangePairs: Map<string, Set<string>> | null = null;
-    const ensureRangePairs = (): Map<string, Set<string>> => {
-        if (!rangePairs) {
-            rangePairs = new Map<string, Set<string>>();
-            for (const c of compressCalls) {
-                let parsed: unknown;
-                try {
-                    parsed = JSON.parse(c.text ?? "");
-                } catch {
-                    continue;
-                }
-                const obj = parsed as { startId?: string; endId?: string; content?: unknown };
-                const ranges: Array<{ startId?: string; endId?: string }> = Array.isArray(obj?.content) ? (obj.content as Array<{ startId?: string; endId?: string }>) : [obj];
-                for (const r of ranges) {
-                    if (typeof r?.startId !== "string" || !r.startId || typeof r?.endId !== "string" || !r.endId) continue;
-                    let ends = rangePairs.get(r.startId);
-                    if (!ends) { ends = new Set<string>(); rangePairs.set(r.startId, ends); }
-                    ends.add(r.endId);
-                }
-            }
-        }
-        return rangePairs;
-    };
-    return { callIds, compressCalls, ensureRangePairs };
-}
-
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
-    const { callIds, compressCalls, ensureRangePairs } = buildCarrierIndex(messages);
-    const carried = new Set<string>();
-    for (const b of state.blocks) {
-        if (!b.active || !b.compressCallId) continue;
-        // #1567: plugin tool API folds are minted a synthetic plugin_<ts> callId
-        // the client can never echo, so the plain id match is unsatisfiable for
-        // them — yet the client's own re-sent compress pair IS their carrier by
-        // contract, making the in-place anchor redundant. Strip it, but only
-        // while that pair actually rides the (post-prepare) history: a pruned
-        // or contract-violating client must never lose the summary outright
-        // (zero carriers).
-        // Preflight blocks (no compressCallId) keep skipping above: no tool
-        // call exists for them, so their anchor is the only carrier.
-        const present = isPluginFoldCallId(b.compressCallId)
-            ? (!b.startRef || !b.endRef ? compressCalls.length > 0 : ensureRangePairs().get(b.startRef)?.has(b.endRef) ?? false)
-            : callIds.has(b.compressCallId);
-        if (present) {
-            carried.add(`acp_summary_${b.blockId}`);
-        }
-    }
-    return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_") || !carried.has(m.id));
+    const carried = carriedFoldBlockIds(messages, state.blocks);
+    return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_") || !carried.has(m.id.slice("acp_summary_".length)));
 }
 
 

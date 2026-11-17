@@ -30,7 +30,7 @@ const user = (text: string): Item => ({ type: "message", role: "user", content: 
 // headers (no plugin marker), and every request is a full `response.create`
 // replay — a `generate: false` probe with empty input first, then one
 // full-history frame per turn. Codex never sends previous_response_id.
-async function fixture() {
+async function fixture(postFoldDelayMs?: number) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-ws-"));
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -73,7 +73,7 @@ async function fixture() {
     await once(upstream, "listening");
     const config = defaultConfig(200000);
     config.preserveRecentTokens = 0;
-    const opts: ProxyOptions = { host: "127.0.0.1", port: 0, upstream: "http://127.0.0.1", routes: {}, modelContextLimit: 200000, kernelConfig: config, compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: true, logFile: path.join(tmp, "bili.log"), debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } };
+    const opts: ProxyOptions = { host: "127.0.0.1", port: 0, upstream: "http://127.0.0.1", routes: {}, modelContextLimit: 200000, kernelConfig: config, compress: { injectTool: true, injectNudge: false, postFoldDelayMs }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: true, logFile: path.join(tmp, "bili.log"), debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } };
     const proxy = await startServer(opts);
     await once(proxy, "listening");
     const proxyOrigin = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
@@ -321,8 +321,10 @@ test("codex WS: later turns replay full history; no previous_response_id is ever
     } finally { await f.close(); }
 });
 
-test("codex WS: folding covered history shrinks the replayed turn", { timeout: 30000 }, async () => {
-    const f = await fixture();
+for (const delayMs of [undefined, 120]) test(`codex WS: folding covered history shrinks the replayed turn (delay=${delayMs ?? "unset"})`, { timeout: 30000 }, async () => {
+    const f = await fixture(delayMs);
+    const forwards: string[] = [];
+    setLogCapture((_level, line) => { if (line.includes("forward WS")) forwards.push(line); });
     try {
         await f.probe();
         // Codex replays the FULL history every turn (no previous_response_id);
@@ -347,18 +349,30 @@ test("codex WS: folding covered history shrinks the replayed turn", { timeout: 3
         assert.equal(out.ok, true, JSON.stringify(out));
         assert.match(out.result, /Compressed/);
         f.setToolArguments("{}");
-        completed(await f.turn([
+        const foldedHistory = [
             ...replay,
             { type: "function_call", id: "fc_compress", call_id: "call_compress", name: "compress", arguments: JSON.stringify(args) },
             { type: "function_call_output", call_id: "call_compress", output: out.result },
             user("continue after fold"),
-        ]));
+        ];
+        assert.equal(forwards.some(line => line.includes("postFoldDelayMs=")), false);
+        const start = performance.now();
+        const folded = completed(await f.turn(foldedHistory));
+        if (delayMs !== undefined) {
+            assert.ok(performance.now() - start >= delayMs - 8, "first folded WS frame must wait before upstream");
+            assert.match(forwards.at(-1) ?? "", /postFoldDelayMs=120 postFoldWaitedMs=\d+/);
+        }
         const row = f.rows.at(-1)!;
         assert.ok(!JSON.stringify(row.request.input).includes("OLD-BULKY-SENTINEL"), JSON.stringify((row.request.input as Item[]).filter(item => JSON.stringify(item).includes("OLD-BULKY-SENTINEL")).map(item => JSON.stringify(item.content).slice(0, 180))));
         assert.ok(JSON.stringify(row.request.input).includes("SUMMARY-CODEX-WS-FOLD"));
         assert.ok(peekSession(f.sid)?.state.blocks.some(b => b.active));
+        const reply = Array.isArray(folded.output) ? (folded.output.find(item => item && typeof item === "object" && item.type === "message") as Item | undefined) : undefined;
+        completed(await f.turn([...foldedHistory, ...(reply ? [reply] : []), user("next ordinary turn")]));
+        assert.equal(forwards.filter(line => line.includes("postFoldDelayMs=")).length, delayMs === undefined ? 0 : 1);
+        assert.equal(f.rows.length, 9, "one upstream WS frame per client turn plus the initial probe");
+        assert.equal(f.upstreamConnections.length, 1, "reuse the formal upstream socket");
         assert.equal(f.httpRequests, 0);
-    } finally { await f.close(); }
+    } finally { setLogCapture(null); await f.close(); }
 });
 
 test("codex WS: admission requires the conversation header and the responses path", { timeout: 30000 }, async () => {

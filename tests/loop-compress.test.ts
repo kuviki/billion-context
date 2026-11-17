@@ -60,7 +60,7 @@ async function drain(
     stream: ReadableStream<Uint8Array>,
     ctx: ReturnType<typeof makeCtx>,
     requestBody: Record<string, unknown>,
-    requestOptions: { url: string; headers: Record<string, string> },
+    requestOptions: { url: string; headers: Record<string, string>; postFoldDelayMs?: number },
     adapter: ReturnType<typeof createResponsesAdapter> = createResponsesAdapter(),
 ): Promise<string> {
     const chunks: Buffer[] = [];
@@ -575,6 +575,7 @@ test("loop #422a: successful compress → re-request carries the refreshed fold 
         COMPLETED,
     ].join("");
     const probe = reFetchProbe();
+    const logs: string[] = []; ctx.log = line => logs.push(line);
     let refreshCalls = 0;
     try {
         ctx.refreshFolded = (current) => {
@@ -594,7 +595,7 @@ test("loop #422a: successful compress → re-request carries the refreshed fold 
             new Response(round1, { status: 200 }).body!,
             ctx,
             { model: "gpt-4o", input: [], stream: true },
-            { url: "http://mock", headers: {} },
+            { url: "http://mock", headers: {}, postFoldDelayMs: 25 },
         );
         assert.ok(probe.calls() >= 1, "re-request fired");
         const body = probe.bodies()[0]!;
@@ -602,6 +603,7 @@ test("loop #422a: successful compress → re-request carries the refreshed fold 
         assert.ok(!body.includes("consumed content"), "consumed content is folded out of the re-request");
         assert.ok(body.includes("SUMMARY-422"), "round records (compress call args) ride on top of the fresh fold");
         assert.ok(body.includes("[Compressed m00001"), "compress tool-result present in the re-request tail");
+        assert.equal(logs.filter(line => line.includes("postFoldDelayMs=25")).length, 1);
         assert.equal(refreshCalls, 1, "refreshFolded called exactly once for one successful compress");
         assert.equal(ctx.session.stats.compressCreditTokens, 0, "credit cleared once the fold reached a model-visible request");
     } finally {
@@ -679,6 +681,7 @@ test("loop #422c: refreshFolded throws → re-request keeps the pre-compress vie
         COMPLETED,
     ].join("");
     const probe = reFetchProbe();
+    const logs: string[] = []; ctx.log = line => logs.push(line);
     try {
         let refreshCalled = false;
         ctx.refreshFolded = () => {
@@ -689,8 +692,9 @@ test("loop #422c: refreshFolded throws → re-request keeps the pre-compress vie
             new Response(round1, { status: 200 }).body!,
             ctx,
             { model: "gpt-4o", input: [], stream: true },
-            { url: "http://mock", headers: {} },
+            { url: "http://mock", headers: {}, postFoldDelayMs: 25 },
         );
+        assert(!logs.some(line => line.includes("postFoldDelayMs=")));
         assert.ok(refreshCalled, "compress succeeded and refreshFolded was invoked (the throw path is what we test)");
         assert.ok(probe.calls() >= 1, "re-request fired despite the refresh failure");
         assert.ok(probe.bodies()[0]!.includes("consumed content"), "pre-compress view kept as fallback");

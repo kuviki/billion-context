@@ -209,6 +209,8 @@ export type ModelEntry = {
  *  {@link mergeCompress} (child covers parent, per field, not whole-object). Every
  *  field is optional; unset fields fall through to the kernel default. */
 export type CompressSettings = {
+    /** Host-side wait before the first model request carrying a new fold. 0 disables it. */
+    postFoldDelayMs?: number;
     /** External summary chain — three-level like every other compress field
      *  (whole-chain replace at provider/model level, no sub-merge). File shape:
      *  references into the named providers table ("glm/glm-4.9-flash"),
@@ -2557,6 +2559,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // an unknown top-level key that appears here almost certainly belongs one
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
+    "postFoldDelayMs",
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
     "nudgeGrowthTokens", "minPressureBenefitTokens", "requireUsageSampleForPressure", "maxEstimateHoldRounds", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "requireNudge", "requireRecommendation",
@@ -3266,6 +3269,14 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
             loggerLog("warn", `[config] compress.externalSummary is invalid (${error instanceof Error ? error.message : String(error)}); ignoring the whole compress section`);
             return undefined;
         }
+    }
+    if ("postFoldDelayMs" in obj) {
+        const delay = obj.postFoldDelayMs;
+        if (typeof delay !== "number" || !Number.isInteger(delay) || delay < 0 || delay > 120_000) {
+            loggerLog("warn", "[config] compress.postFoldDelayMs must be an integer from 0 to 120000; ignoring the whole compress section");
+            return undefined;
+        }
+        out.postFoldDelayMs = delay;
     }
     const numberOrPercent = (value: unknown): value is number | string =>
         typeof value === "number" && Number.isFinite(value)

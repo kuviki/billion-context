@@ -1,0 +1,13 @@
+domain: compress
+entries:
+  - key: compress.postFoldDelayMs
+    type: "integer (milliseconds)"
+    default: "0"
+    group: compress
+    id: compress.postFoldDelayMs
+    render: compress-row
+    desc_en: "Wait once before sending the first model request that carries a newly applied compression. Accepts 0–120,000 ms; 0 disables it. Configurable globally, per provider, and per model. Sends no prewarm request."
+    desc_zh: "首次发出带有新压缩结果的正式模型请求前，仅等待一次。范围 0–120,000 毫秒；0 为关闭。支持全局、供应商和模型三级配置。不会发送预热请求。"
+    desc_ja: "新たな圧縮結果を含む最初のモデルリクエストの送信前に一度だけ待機します。範囲は 0～120,000 ms で、0 は無効です。グローバル、プロバイダー、モデル単位で設定でき、予熱リクエストは送信しません。"
+    site_en: "Wait once before the first model request carrying a new compression result. 0–120,000 ms; 0 is off. Global, provider, and model overrides; no prewarm request."
+    site_zh: "首次发送包含新压缩结果的模型请求前仅等待一次。0–120,000 毫秒，0 为关闭；支持全局、供应商、模型覆盖，不发送预热请求。"

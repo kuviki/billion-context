@@ -162,6 +162,7 @@ billion-context/
 │   ├── encrypt.ts                # At-rest encoding: AES-256-GCM (#708) + zstd (#1080), independent
 │   ├── export.ts                 # Session export (block summaries + originals)
 │   ├── preflight.ts              # Preflight compression gate (hold grace, dead-end cooldown)
+│   ├── post-fold-delay.ts        # Optional one-shot wait before the first model send carrying a committed fold
 │   ├── external-summary.ts       # Isolated summary executor (ordered failover, deadlines, capacity)
 │   ├── external-summary-http.ts  # Internal single-attempt HTTP candidates using existing summary codecs
 │   ├── external-summary-settings.ts # Global external-summary target and budget validation

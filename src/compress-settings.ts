@@ -72,6 +72,7 @@ export function mergeCompress(
         outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
         maxContextLimit: pick("maxContextLimit"),
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
+        postFoldDelayMs: pick("postFoldDelayMs"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
         minPressureBenefitTokens: pick("minPressureBenefitTokens"),
         requireUsageSampleForPressure: pick("requireUsageSampleForPressure"),
