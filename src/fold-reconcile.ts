@@ -974,6 +974,27 @@ export function planReconciliation(
     }
     const claimedCandidates = new Set<string>();
 
+    // Invocation-local and lazy: preserve every matching gate and scan order,
+    // but tokenize each candidate at most once per evidence kind (#6801).
+    const canonical = new WeakMap<CoreMessage, string>();
+    const wordBags = new WeakMap<CoreMessage, number>();
+    const sketches = new WeakMap<CoreMessage, string>();
+    const canonicalOf = (m: CoreMessage): string => {
+        let text = canonical.get(m);
+        if (text === undefined) canonical.set(m, (text = canonicalTextOf(m.text ?? "")));
+        return text;
+    };
+    const wordBagOf = (m: CoreMessage): number => {
+        let wh = wordBags.get(m);
+        if (wh === undefined) wordBags.set(m, (wh = wordBagDigest(canonicalOf(m))));
+        return wh;
+    };
+    const sketchOf = (m: CoreMessage): string => {
+        let sh = sketches.get(m);
+        if (sh === undefined) sketches.set(m, (sh = simhashHex(canonicalOf(m))));
+        return sh;
+    };
+
     // Missing covered ids inside the churn region, in previous-pass order.
     const missingMiddle: string[] = [];
     for (let i = prefix; i < oldOrder.length - suffix; i++) {
@@ -1402,7 +1423,7 @@ export function planReconciliation(
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
             // (a) simhash corroboration
             if (anchor.sh !== undefined) {
-                const sketch = simhashHex(canonicalTextOf(message.text ?? ""));
+                const sketch = sketchOf(message);
                 if (hammingHex(anchor.sh, sketch) >= 0 && hammingHex(anchor.sh, sketch) <= GAP_SIMHASH_MAX_HAMMING) {
                     // Edit-honesty gate (#2480/#1908/#1921): the sketch says
                     // "near-duplicate", but near is not equal — a one-word
@@ -1411,7 +1432,7 @@ export function planReconciliation(
                     // the fold. Only word-preserving churn (reorder, bracket/
                     // whitespace/template punctuation re-stamps) may claim;
                     // any prose change falls through to honest re-entry.
-                    if (anchor.wh === undefined || anchor.wh === wordBagDigest(canonicalTextOf(message.text ?? ""))) {
+                    if (anchor.wh === undefined || anchor.wh === wordBagOf(message)) {
                         plan.claims.set(gap.oldId, [gap.newId]);
                         claimedCandidates.add(gap.newId);
                         plan.bySim++;
@@ -1464,9 +1485,9 @@ export function planReconciliation(
                 return normalizedIdentity(unwrapped) === anchor.n;
             }
             if (anchor.wh === undefined || anchor.sh === undefined) return false;
-            const wh = wordBagDigest(canonicalTextOf(m.text ?? ""));
+            const wh = wordBagOf(m);
             if (wh !== anchor.wh) return false;
-            const dist = hammingHex(anchor.sh, simhashHex(canonicalTextOf(m.text ?? "")));
+            const dist = hammingHex(anchor.sh, sketchOf(m));
             return dist >= 0 && dist <= GAP_SIMHASH_MAX_HAMMING;
         };
         // prose pairing — order-preserving: walk anchors in conversation
@@ -1580,8 +1601,8 @@ export function planReconciliation(
                 && (anchor.r === undefined || anchor.r === c.message.role)
                 && (
                     (anchor.wh !== undefined && anchor.sh !== undefined
-                        && wordBagDigest(canonicalTextOf(c.message.text ?? "")) === anchor.wh
-                        && (() => { const d = hammingHex(anchor.sh!, simhashHex(canonicalTextOf(c.message.text ?? ""))); return d >= 0 && d <= GAP_SIMHASH_MAX_HAMMING; })())
+                        && wordBagOf(c.message) === anchor.wh
+                        && (() => { const d = hammingHex(anchor.sh!, sketchOf(c.message)); return d >= 0 && d <= GAP_SIMHASH_MAX_HAMMING; })())
                 ));
             // textless anchors (no sh/wh — image cells, #3588) carry NO
             // evidence channel: claimable families were already claimed by
