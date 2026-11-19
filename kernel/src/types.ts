@@ -71,6 +71,9 @@ export interface CompressionBlock {
   tier: CompressionTier;
   topic?: string;
   summary: string;
+  /** Render-only fallback: stable surviving user successor when coverage is
+   * absent from the current view. Never a coverage claim or array position. */
+  fallbackUserMessageId?: string;
   directMessageIds: string[];
   effectiveMessageIds: string[];
   directBlockIds: string[];
@@ -834,14 +837,6 @@ export interface ProcessTurnResult {
   messages: CoreMessage[];
   state: CompressionState;
   nudge?: NudgeDecision;
-  /** Compact always-current boundary line, present only on turns where a
-   *  compression round is live (nudge plan with offered ranges) but the
-   *  advisory banner itself is NOT being delivered this request. Carries the
-   *  session's highest allocated ref and the currently offered ranges so the
-   *  model never has to guess refs between banner deliveries (#4521). Hosts
-   *  append it as an ephemeral trailing user message, same carrier as a
-   *  nudge. */
-  statusLine?: string;
   /** Terminal floor detected (#300): compression and truncation are both
    *  exhausted while usage stays at/above truncate.threshold. Emitted every
    *  event while the condition holds; hosts surface it once. */
