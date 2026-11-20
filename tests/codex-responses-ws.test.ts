@@ -111,7 +111,7 @@ async function fixture() {
     const turn = (input: Item[], client: WebSocket = peer): Promise<Item[]> => exchange(frame(input), client);
     const peer = await openPeer();
     peer.on("error", e => console.error("[TEST-CLIENT-ERR]", e.message));
-    return { rows, upstreamConnections, sid, proxyOrigin, upstreamOrigin, proxy, peer, turn, probe, frame, openPeer,
+    return { rows, upstreamConnections, sid, proxyOrigin, upstreamOrigin, proxy, peer, turn, probe, frame, exchange, openPeer,
         logPath: path.join(tmp, "bili.log"),
         setToolArguments: (args: string) => { toolArguments = args; }, get httpRequests() { return httpRequests; }, close: async () => {
         peer.terminate();
@@ -126,6 +126,35 @@ const completed = (events: Item[]): Item => {
     assert.ok(event, JSON.stringify(events));
     return event.response as Item;
 };
+
+test("codex WS: a changed per-turn metadata value accompanies an upstream continuation", { timeout: 30000 }, async () => {
+    const priorRenderNone = process.env.ACP_RENDER_NONE;
+    process.env.ACP_RENDER_NONE = "1";
+    const f = await fixture();
+    try {
+        const oldMetadata = { session_id: f.sid, turn_id: "first", "x-codex-ws-stream-request-start-ms": "1" };
+        const newMetadata = { session_id: f.sid, turn_id: "second", "x-codex-ws-stream-request-start-ms": "2" };
+        const initial = completed(await f.exchange(f.frame([user("first")], { client_metadata: oldMetadata }), f.peer));
+        const empty = completed(await f.exchange(f.frame([], { previous_response_id: initial.id, client_metadata: newMetadata }), f.peer));
+        assert.equal(f.rows[1].request.previous_response_id, initial.id);
+        assert.deepEqual(f.rows[1].request.input, []);
+        assert.deepEqual(f.rows[1].request.client_metadata, newMetadata);
+        await f.exchange(f.frame([user("fresh")], { previous_response_id: empty.id, client_metadata: oldMetadata }), f.peer);
+        assert.equal(f.rows.length, 3);
+        const first = f.rows[0].request;
+        const second = f.rows[2].request;
+        const changed = [...new Set([...Object.keys(first), ...Object.keys(second)])].filter(key => key !== "input" && JSON.stringify(first[key]) !== JSON.stringify(second[key]));
+        const shape = (input: unknown) => Array.isArray(input) ? input.map(item => ({ type: item.type, role: item.role, size: JSON.stringify(item).length })) : input;
+        assert.equal(second.previous_response_id, empty.id, JSON.stringify({ changed, firstInput: shape(first.input), secondInput: shape(second.input) }));
+        assert.deepEqual(second.client_metadata, oldMetadata);
+        assert.notEqual(second.generate, false);
+        assert.ok(JSON.stringify(second.input).includes("fresh"));
+    } finally {
+        await f.close();
+        if (priorRenderNone === undefined) delete process.env.ACP_RENDER_NONE;
+        else process.env.ACP_RENDER_NONE = priorRenderNone;
+    }
+});
 
 test("codex WS: prewarm probe plus full-replay turns ride the prefix lane through ACP", { timeout: 30000 }, async () => {
     const f = await fixture();
