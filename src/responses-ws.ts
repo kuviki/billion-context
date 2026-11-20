@@ -10,6 +10,7 @@ import { getStore } from "./persist.js";
 import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
 import { identitySig, SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
 import { markWsLaneTransport, withFetchTransport } from "./fetch-transport.js";
+import { isCodexHost } from "./codex-compact.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
 import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { BILI_TUNNEL_HEADER } from "./tunnel-guard.js";
@@ -153,11 +154,31 @@ function canonical(value: unknown): string {
     return JSON.stringify(value) ?? "null";
 }
 
-function comparable(item: unknown): unknown {
+// Only ignore read-only token counts and unclassified kinds on item types we
+// know. Turn identity, timestamps, provenance, tool-result metadata, meaningful
+// kinds and unknown fields still participate: a delta cannot update an earlier item.
+const CODEX_METADATA_ITEMS = new Set([
+    "message", "agent_message", "reasoning", "local_shell_call", "function_call", "function_call_output",
+    "custom_tool_call", "custom_tool_call_output", "tool_search_call", "tool_search_output", "web_search_call",
+    "image_generation_call",
+]);
+
+function comparable(item: unknown, codexReplay = false): unknown {
     if (!object(item)) return item;
     const result = { ...item };
-    delete result.status;
+    if (!codexReplay) delete result.status;
     if (!result.type && typeof result.role === "string") result.type = "message";
+    if (codexReplay && typeof result.type === "string" && CODEX_METADATA_ITEMS.has(result.type)) {
+        const rawMetadata = result.internal_chat_message_metadata_passthrough;
+        if (rawMetadata === null) delete result.internal_chat_message_metadata_passthrough;
+        else if (object(rawMetadata)) {
+            const metadata = { ...rawMetadata };
+            if (metadata.content_token_count === null || (typeof metadata.content_token_count === "number" && Number.isFinite(metadata.content_token_count))) delete metadata.content_token_count;
+            if (metadata.content_item_kinds === null || (Array.isArray(metadata.content_item_kinds) && metadata.content_item_kinds.length > 0 && metadata.content_item_kinds.every(kind => kind === "unknown"))) delete metadata.content_item_kinds;
+            if (Object.keys(metadata).length === 0) delete result.internal_chat_message_metadata_passthrough;
+            else result.internal_chat_message_metadata_passthrough = metadata;
+        }
+    }
     return result;
 }
 
@@ -230,7 +251,7 @@ class ResponsesWsOutput {
 
 export class ResponsesWsHistory {
     private checkpoint?: Checkpoint;
-    constructor(private readonly limitBytes = limitsReceiveBytes()) {}
+    constructor(private readonly limitBytes = limitsReceiveBytes(), private readonly codexReplay = false) {}
 
     expand(frame: JsonObject): JsonObject {
         const { type: _type, previous_response_id: previous, ...request } = frame;
@@ -275,9 +296,16 @@ export class ResponsesWsHistory {
         const { input: _input, ...fields } = request;
         const items = request.input;
         const { input: _priorInput, ...priorFields } = prior.request;
-        if (canonical(fields) !== canonical(priorFields)) return request;
+        // These are response-scoped in Codex, not part of the checkpoint's
+        // conversation history. Keep the current values in the outgoing frame.
+        const comparableFields = (value: JsonObject): JsonObject => {
+            if (!this.codexReplay) return value;
+            const { client_metadata: _metadata, access_programs: _access, generate: _generate, stream_options: _streamOptions, ...rest } = value;
+            return rest;
+        };
+        if (canonical(comparableFields(fields)) !== canonical(comparableFields(priorFields))) return request;
         const baseline = [...prior.request.input, ...prior.output];
-        if (items.length <= baseline.length || !baseline.every((item, i) => canonical(comparable(item)) === canonical(comparable(items[i])))) return request;
+        if (items.length < baseline.length || (!this.codexReplay && items.length === baseline.length) || !baseline.every((item, i) => canonical(comparable(item, this.codexReplay)) === canonical(comparable(items[i], this.codexReplay)))) return request;
         return { ...fields, input: items.slice(baseline.length), previous_response_id: prior.id };
     }
 
@@ -332,10 +360,12 @@ export class ResponsesWsUpstream {
     private connectionGeneration = 0;
     private sendSequence = 0;
     private key?: string;
-    private history = new ResponsesWsHistory();
+    private history: ResponsesWsHistory;
     private active?: { fail: (error: Error, reason?: string) => void };
 
-    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = limitsReceiveBytes(), private readonly hopStamp?: string, private readonly forwardTransportFields = false) {}
+    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = limitsReceiveBytes(), private readonly hopStamp?: string, private readonly forwardTransportFields = false, codexReplay = false) {
+        this.history = new ResponsesWsHistory(limitsReceiveBytes(), codexReplay);
+    }
 
     private resetHistory(reason: string): void {
         this.history.clear();
@@ -760,12 +790,14 @@ class ResponsesWsResponse extends http.ServerResponse {
 export class ResponsesWsSession implements WsBridgeSession {
     private readonly transport: ResponsesWsUpstream;
     private readonly history = new ResponsesWsHistory();
+    private readonly codexReplay: boolean;
     private readonly budget = limitsReceiveBytes();
     private active?: ResponsesWsResponse;
     private busy = false;
 
     constructor(private readonly context: WsBridgeContext) {
-        this.transport = new ResponsesWsUpstream(context.log, undefined, context.instanceId, context.codec.allowStreamFlag === true);
+        this.codexReplay = context.codec.name === "codex-responses-ws" && context.source.headers["x-bili-plugin"] === undefined && isCodexHost(context.source.headers);
+        this.transport = new ResponsesWsUpstream(context.log, undefined, context.instanceId, context.codec.allowStreamFlag === true, this.codexReplay);
         context.log("info", "Responses socket connected (ACP request pipeline)");
     }
 
