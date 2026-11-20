@@ -40,9 +40,15 @@ for (const { renderTags, client } of [
             internal_chat_message_metadata_passthrough: { content_token_count: 48, create_time: 1795117760.5 + n, turn_id: turn },
             role: "assistant", status: "completed", content: [{ type: "output_text", text: `answer-${n}`, annotations: [], logprobs: [] }], phase: "commentary",
         };
-        const response = { id: `resp_${n}`, object: "response", status: "completed", output: [item], usage: { input_tokens: 100, output_tokens: 4, total_tokens: 104 } };
+        const reasoning: Item = {
+            type: "reasoning", id: `rs_test_${n}`, metadata: { turn_id: turn },
+            internal_chat_message_metadata_passthrough: { turn_id: turn },
+            summary: [], content: [], encrypted_content: `encrypted-${n}`,
+        };
+        const response = { id: `resp_${n}`, object: "response", status: "completed", output: [reasoning, item], usage: { input_tokens: 100, output_tokens: 4, total_tokens: 104 } };
         peer.send(JSON.stringify({ type: "response.created", response: { id: response.id, status: "in_progress", output: [] } }));
-        peer.send(JSON.stringify({ type: "response.output_item.done", output_index: 0, item }));
+        peer.send(JSON.stringify({ type: "response.output_item.done", output_index: 0, item: reasoning }));
+        peer.send(JSON.stringify({ type: "response.output_item.done", output_index: 1, item }));
         peer.send(JSON.stringify({ type: "response.completed", response }));
     }));
     upstream.listen(0, "127.0.0.1");
@@ -96,22 +102,35 @@ for (const { renderTags, client } of [
         return { type: "message", status: item.status, id: item.id, role: item.role, content: item.content, phase: item.phase,
             internal_chat_message_metadata_passthrough: { turn_id: metadata.turn_id, create_time: metadata.create_time, content_item_kinds: ["unknown"] } };
     };
+    const replayReasoning = (item: Item): Item => ({
+        type: "reasoning", id: item.id, summary: item.summary, content: null,
+        encrypted_content: item.encrypted_content,
+        internal_chat_message_metadata_passthrough: item.internal_chat_message_metadata_passthrough,
+    });
     try {
         const peer = await connect();
         const first = await exchange(peer, request([user("one")]));
-        const firstOutput = (first.output as Item[])[0];
+        const [firstReasoning, firstOutput] = first.output as Item[];
+        assert.deepEqual(firstReasoning.metadata, { turn_id: "turn-1" });
+        assert.deepEqual(firstReasoning.content, []);
+        assert.equal(firstReasoning.encrypted_content, "encrypted-1");
         assert.deepEqual(firstOutput.metadata, { turn_id: "turn-1" });
         assert.equal((firstOutput.internal_chat_message_metadata_passthrough as Item).content_token_count, 48);
         const second = await exchange(peer, request([user("two")], String(first.id)));
-        const secondOutput = (second.output as Item[])[0];
+        const [secondReasoning, secondOutput] = second.output as Item[];
         peer.close();
         await once(peer, "close");
         const reconnected = await connect();
-        await exchange(reconnected, request([user("one"), replay(firstOutput), user("two"), replay(secondOutput), user("three")]));
+        await exchange(reconnected, request([user("one"), replayReasoning(firstReasoning), replay(firstOutput), user("two"), replayReasoning(secondReasoning), replay(secondOutput), user("three")]));
         const captures = fs.readFileSync(capture, "utf8").trim().split("\n").map(line => JSON.parse(line) as { body: Item });
         assert.equal(captures.length, 3);
         const find = (n: number): Item => {
             const item = (captures[n].body.input as Item[]).find(value => value.id === "msg_test_1");
+            assert.ok(item);
+            return item;
+        };
+        const findReasoning = (n: number): Item => {
+            const item = (captures[n].body.input as Item[]).find(value => value.id === "rs_test_1");
             assert.ok(item);
             return item;
         };
@@ -122,11 +141,19 @@ for (const { renderTags, client } of [
             assert.deepEqual(find(1).metadata, { turn_id: "turn-1" });
             assert.equal((find(1).internal_chat_message_metadata_passthrough as Item).content_token_count, 48);
             assert.deepEqual((find(2).internal_chat_message_metadata_passthrough as Item).content_item_kinds, ["unknown"]);
+            assert.notEqual(JSON.stringify(findReasoning(1)), JSON.stringify(findReasoning(2)));
+            assert.deepEqual(findReasoning(1).content, []);
+            assert.equal(findReasoning(2).content, null);
             return;
         }
         assert.equal(JSON.stringify(find(1)), JSON.stringify(find(2)));
         assert.equal(find(1).metadata, undefined);
         assert.equal((find(1).internal_chat_message_metadata_passthrough as Item).content_token_count, undefined);
+        assert.equal(JSON.stringify(findReasoning(1)), JSON.stringify(findReasoning(2)));
+        assert.deepEqual(findReasoning(1), {
+            type: "reasoning", id: "rs_test_1", summary: [], encrypted_content: "encrypted-1",
+            internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+        });
         // Tags change the actual prompt, so a full upstream resend is required.
         // When there is no such change, metadata drift alone permits a delta.
         if (renderTags) {
@@ -145,5 +172,70 @@ for (const { renderTags, client } of [
         fs.rmSync(tmp, { recursive: true, force: true });
         if (originalRenderNone === undefined) delete process.env.ACP_RENDER_NONE;
         else process.env.ACP_RENDER_NONE = originalRenderNone;
+    }
+});
+
+for (const client of ["codex", "generic", "plugin"] as const) test(`Responses HTTP egress: ${client}`, { timeout: 30000 }, async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-http-replay-"));
+    const captured: Item[] = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => chunks.push(chunk));
+        req.on("end", () => {
+            captured.push(JSON.parse(Buffer.concat(chunks).toString()) as Item);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ id: "resp_http", object: "response", status: "completed", output: [], usage: { input_tokens: 10, output_tokens: 0, total_tokens: 10 } }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const opts: ProxyOptions = {
+        host: "127.0.0.1", port: 0, upstream: "http://127.0.0.1", routes: {}, modelContextLimit: 200000,
+        kernelConfig: defaultConfig(200000), compress: { injectTool: false, injectNudge: false }, promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const sid = `http-replay-test-${randomUUID()}`;
+    const oldReasoning: Item = {
+        type: "reasoning", id: "rs_http_1", metadata: { turn_id: "turn-1" },
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+        summary: [], content: [], encrypted_content: "signed-http-bytes",
+    };
+    const replayReasoning: Item = {
+        type: "reasoning", id: "rs_http_1", summary: [], content: null, encrypted_content: "signed-http-bytes",
+        internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+    };
+    try {
+        for (const reasoning of [oldReasoning, replayReasoning]) {
+            const response = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`, {
+                method: "POST", headers: {
+                    "content-type": "application/json", "session-id": sid,
+                    "user-agent": client === "generic" ? "other-client/1.0" : "codex_exec/0.169.1",
+                    originator: "codex_exec", ...(client === "plugin" ? { "x-bili-plugin": "codex" } : {}),
+                }, body: JSON.stringify({ model: "gpt-5.2", stream: false, input: [user("one"), reasoning, user("two")] }),
+            });
+            assert.equal(response.status, 200);
+            await response.arrayBuffer();
+        }
+        assert.equal(captured.length, 2);
+        const reasonings = captured.map(body => (body.input as Item[]).find(item => item.id === "rs_http_1"));
+        assert.ok(reasonings[0]); assert.ok(reasonings[1]);
+        if (client === "codex") {
+            assert.equal(JSON.stringify(reasonings[0]), JSON.stringify(reasonings[1]));
+            assert.deepEqual(reasonings[0], {
+                type: "reasoning", id: "rs_http_1", summary: [], encrypted_content: "signed-http-bytes",
+                internal_chat_message_metadata_passthrough: { turn_id: "turn-1" },
+            });
+        } else {
+            assert.deepEqual(reasonings[0], oldReasoning);
+            assert.deepEqual(reasonings[1], replayReasoning);
+        }
+    } finally {
+        await Promise.all([new Promise<void>(resolve => proxy.close(() => resolve())), new Promise<void>(resolve => upstream.close(() => resolve()))]);
+        fs.rmSync(tmp, { recursive: true, force: true });
     }
 });

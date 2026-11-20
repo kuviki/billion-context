@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeCodexWsReplayItem, normalizeCodexWsReplayInput } from "../src/codex-ws-replay.ts";
+import { normalizeCodexResponsesEgressItem, normalizeCodexResponsesEgressInput, normalizeCodexWsReplayItem, normalizeCodexWsReplayInput } from "../src/codex-ws-replay.ts";
 import { ResponsesWsHistory } from "../src/responses-ws.ts";
+import { createResponsesAdapter } from "../src/loop/adapter-responses.ts";
+import { responsesToCore, type ResponsesRequestBody } from "acp-kernel/wire";
 
 type Item = Record<string, unknown>;
 const text = [{ type: "output_text", text: "hello", annotations: [], logprobs: [] }];
@@ -86,4 +88,94 @@ test("upstream continuation compares only recognized replay drift; ordinary WS c
         const request = { model: "m", input: [...previousInput, changed, user("next")] };
         assert.strictEqual(history.continuation(request), request);
     }
+});
+
+const reasoningSummary = [{ type: "summary_text", text: "summary" }];
+const oldReasoning: Item = {
+    type: "reasoning", id: "rs_123", metadata: { turn_id: "turn-1" },
+    internal_chat_message_metadata_passthrough: { create_time: pass.create_time, turn_id: pass.turn_id },
+    summary: reasoningSummary, content: [], encrypted_content: "encrypted-signed-bytes",
+};
+const replayReasoning: Item = {
+    type: "reasoning", id: "rs_123", summary: reasoningSummary, content: null,
+    encrypted_content: "encrypted-signed-bytes", internal_chat_message_metadata_passthrough: pass,
+};
+
+test("reasoning is normalized only at egress and preserves encrypted bytes, summary and input identities", () => {
+    const before = JSON.stringify([oldReasoning, replayReasoning]);
+    const ingress = normalizeCodexWsReplayInput([oldReasoning, replayReasoning]);
+    assert.strictEqual(ingress[0], oldReasoning);
+    assert.strictEqual(ingress[1], replayReasoning);
+    const [oldWire, newWire] = normalizeCodexResponsesEgressInput(ingress);
+    assert.equal(JSON.stringify(oldWire), JSON.stringify(newWire));
+    assert.deepEqual(oldWire, {
+        type: "reasoning", id: "rs_123", summary: reasoningSummary,
+        encrypted_content: "encrypted-signed-bytes", internal_chat_message_metadata_passthrough: pass,
+    });
+    assert.equal(JSON.stringify([oldReasoning, replayReasoning]), before);
+    assert.deepEqual(normalizeCodexResponsesEgressItem(oldWire), oldWire);
+    const absent = { type: "reasoning", id: "rs_123", summary: reasoningSummary, encrypted_content: "signed" };
+    assert.deepEqual(normalizeCodexResponsesEgressItem({ ...absent, content: null }), absent);
+    assert.deepEqual(normalizeCodexResponsesEgressItem({ ...absent, content: [] }), absent);
+});
+
+test("reasoning unknown structures, actual content and attribution are forwarded untouched", () => {
+    const unsafe: unknown[] = [
+        { ...oldReasoning, id: "other" },
+        { ...oldReasoning, future_field: true },
+        { ...oldReasoning, encrypted_content: null },
+        { ...oldReasoning, encrypted_content: "" },
+        { ...oldReasoning, summary: null },
+        { ...oldReasoning, content: [{ type: "reasoning_text", text: "must survive" }] },
+        { ...oldReasoning, content: {} },
+        { ...oldReasoning, metadata: { turn_id: "different" } },
+        { ...oldReasoning, metadata: { turn_id: "turn-1", other: "must survive" } },
+        { ...oldReasoning, internal_chat_message_metadata_passthrough: { ...pass, content_item_metadata: [{ provenance: { type: "tool" } }] } },
+        { ...oldReasoning, internal_chat_message_metadata_passthrough: null },
+        { ...oldReasoning, internal_chat_message_metadata_passthrough: { ...pass, create_time: null } },
+        { ...oldReasoning, internal_chat_message_metadata_passthrough: undefined },
+        { type: "function_call", id: "fc_1", arguments: "{}" },
+    ];
+    for (const item of unsafe) assert.strictEqual(normalizeCodexResponsesEgressItem(item), item);
+});
+
+test("reasoning continuation accepts only the recognized empty-content envelope difference", () => {
+    const previousInput = [user("first")];
+    const history = new ResponsesWsHistory(1_000_000, true);
+    history.commit({ model: "m", input: previousInput }, { id: "resp-1", status: "completed", output: [oldReasoning] });
+    const full = { model: "m", input: [...previousInput, replayReasoning, user("next")] };
+    assert.deepEqual(history.continuation(full), { model: "m", input: [user("next")], previous_response_id: "resp-1" });
+    const generic = new ResponsesWsHistory(1_000_000);
+    generic.commit({ model: "m", input: previousInput }, { id: "resp-1", status: "completed", output: [oldReasoning] });
+    assert.strictEqual(generic.continuation(full), full);
+    for (const changed of [
+        { ...replayReasoning, id: "rs_other" },
+        { ...replayReasoning, encrypted_content: "changed" },
+        { ...replayReasoning, summary: [{ type: "summary_text", text: "changed" }] },
+        { ...replayReasoning, content: [{ type: "reasoning_text", text: "new content" }] },
+        { ...replayReasoning, internal_chat_message_metadata_passthrough: { ...pass, turn_id: "different" } },
+        { ...replayReasoning, internal_chat_message_metadata_passthrough: { ...pass, create_time: pass.create_time + 1 } },
+        { ...replayReasoning, internal_chat_message_metadata_passthrough: { ...pass, content_item_kinds: ["tool"] } },
+        { ...replayReasoning, metadata: { turn_id: "different" } },
+        { ...replayReasoning, future_field: true },
+    ]) {
+        const request = { model: "m", input: [...previousInput, changed, user("next")] };
+        assert.strictEqual(history.continuation(request), request);
+    }
+});
+
+test("Codex HTTP internal-loop rebuild uses the same egress form; generic Responses keeps the original", () => {
+    const body = { model: "m", input: [user("first"), oldReasoning, user("next")], stream: true } as unknown as ResponsesRequestBody;
+    const projection = responsesToCore(body);
+    const codex = createResponsesAdapter(false, projection, undefined, undefined, true);
+    const generic = createResponsesAdapter(false, projection);
+    const rebuilt = codex.buildRequest(projection.msgs, "", body as unknown as Item) as Item;
+    const plain = generic.buildRequest(projection.msgs, "", body as unknown as Item) as Item;
+    const find = (value: Item): Item => {
+        const item = (value.input as Item[]).find(entry => entry.id === "rs_123");
+        assert.ok(item);
+        return item;
+    };
+    assert.deepEqual(find(rebuilt), normalizeCodexResponsesEgressItem(oldReasoning));
+    assert.deepEqual(find(plain), oldReasoning);
 });

@@ -11,7 +11,7 @@ import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
 import { identitySig, SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
 import { markCodexWsReplayTransport, markWsLaneTransport, withFetchTransport } from "./fetch-transport.js";
 import { isCodexHost } from "./codex-compact.js";
-import { normalizeCodexWsReplayInput, normalizeCodexWsReplayItem } from "./codex-ws-replay.js";
+import { normalizeCodexResponsesEgressItem, normalizeCodexWsReplayInput } from "./codex-ws-replay.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
 import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { BILI_TUNNEL_HEADER } from "./tunnel-guard.js";
@@ -279,7 +279,7 @@ export class ResponsesWsHistory {
         const { input: _priorInput, ...priorFields } = prior.request;
         if (canonical(fields) !== canonical(priorFields)) return request;
         const baseline = [...prior.request.input, ...prior.output];
-        const comparison = (item: unknown): unknown => comparable(this.codexReplay ? normalizeCodexWsReplayItem(item) : item);
+        const comparison = (item: unknown): unknown => comparable(this.codexReplay ? normalizeCodexResponsesEgressItem(item) : item);
         if (items.length <= baseline.length || !baseline.every((item, i) => canonical(comparison(item)) === canonical(comparison(items[i])))) return request;
         return { ...fields, input: items.slice(baseline.length), previous_response_id: prior.id };
     }

@@ -57,3 +57,50 @@ export function normalizeCodexWsReplayItem(item: unknown): unknown {
 export function normalizeCodexWsReplayInput(input: unknown[]): unknown[] {
     return input.map(normalizeCodexWsReplayItem);
 }
+
+const REASONING_KEYS = new Set(["type", "id", "summary", "content", "encrypted_content", "metadata", "internal_chat_message_metadata_passthrough"]);
+const REASONING_PASSTHROUGH_KEYS = new Set(["turn_id", "create_time"]);
+const TURN_METADATA_KEYS = new Set(["turn_id"]);
+
+/** Normalize only the observed encrypted Codex reasoning envelope. This is
+ * an egress operation: applying it to the incoming history would change the
+ * kernel's opaque identity. The encrypted payload and summary stay verbatim.
+ * Unknown fields, attribution, and nonempty content are left untouched. */
+function normalizeCodexReasoningEgressItem(item: unknown): unknown {
+    if (!object(item) || !onlyKeys(item, REASONING_KEYS) || item.type !== "reasoning"
+        || typeof item.id !== "string" || !item.id.startsWith("rs_")
+        || !Array.isArray(item.summary)
+        || typeof item.encrypted_content !== "string" || item.encrypted_content.length === 0
+        || (item.content !== undefined && item.content !== null
+            && (!Array.isArray(item.content) || item.content.length !== 0))) return item;
+
+    const pass = item.internal_chat_message_metadata_passthrough;
+    if (pass !== undefined && (!object(pass) || !onlyKeys(pass, REASONING_PASSTHROUGH_KEYS)
+        || typeof pass.turn_id !== "string" || !pass.turn_id
+        || (pass.create_time !== undefined && (typeof pass.create_time !== "number" || !Number.isFinite(pass.create_time))))) return item;
+    if (item.metadata !== undefined
+        && (!object(item.metadata) || !onlyKeys(item.metadata, TURN_METADATA_KEYS)
+            || !object(pass) || item.metadata.turn_id !== pass.turn_id)) return item;
+
+    return {
+        type: item.type,
+        id: item.id,
+        summary: item.summary,
+        encrypted_content: item.encrypted_content,
+        ...(object(pass) ? { internal_chat_message_metadata_passthrough: {
+            turn_id: pass.turn_id,
+            ...(pass.create_time !== undefined ? { create_time: pass.create_time } : {}),
+        } } : {}),
+    };
+}
+
+/** The wire representation and the upstream continuation comparison must use
+ * the same equivalence; ingress intentionally uses assistant normalization
+ * only, so historical reasoning identifiers remain unchanged. */
+export function normalizeCodexResponsesEgressItem(item: unknown): unknown {
+    return normalizeCodexReasoningEgressItem(normalizeCodexWsReplayItem(item));
+}
+
+export function normalizeCodexResponsesEgressInput(input: unknown[]): unknown[] {
+    return input.map(normalizeCodexResponsesEgressItem);
+}

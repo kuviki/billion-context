@@ -14,8 +14,8 @@ import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
-import { normalizeCodexWsReplayInput } from "../codex-ws-replay.js";
-import { isCodexWsReplayTransport } from "../fetch-transport.js";
+import { normalizeCodexResponsesEgressInput } from "../codex-ws-replay.js";
+import { currentFetchTransport, isCodexWsReplayTransport, isWsLaneTransport } from "../fetch-transport.js";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
@@ -651,8 +651,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // can leave a tool-call run without its reasoning item. Repair BEFORE the
     // sentinel sees the array (a normalized body must not fire its own canary).
     if (Array.isArray(rebuiltInput)) rebuiltInput = normalizeStrictEchoResponsesInput(rebuiltInput, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
-    if (isCodexWsReplayTransport() && Array.isArray(rebuiltInput)) {
-        rebuiltInput = normalizeCodexWsReplayInput(rebuiltInput) as ResponseInputItem[];
+    const codexResponsesReplay = isCodexWsReplayTransport() || (
+        !isWsLaneTransport(currentFetchTransport()) && !pluginMode
+        && req.headers["x-bili-plugin"] === undefined && isCodexHost(req.headers)
+    );
+    if (codexResponsesReplay && Array.isArray(rebuiltInput)) {
+        rebuiltInput = normalizeCodexResponsesEgressInput(rebuiltInput) as ResponseInputItem[];
     }
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
@@ -766,6 +770,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         judgeBaseline,
         ...(separatorManifest !== undefined ? { separatorManifest } : {}),
         responsesProjection,
+        codexResponsesReplay,
         systemNotes: sysNotes,
         protocol: "responses",
         stream,
