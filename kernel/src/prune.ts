@@ -1,5 +1,9 @@
 import { activeBlocks, coveredMessageIds } from "./state.js";
-import type { CompressionState, CoreMessage } from "./types.js";
+import type {
+  CompressionBlock,
+  CompressionState,
+  CoreMessage,
+} from "./types.js";
 
 export const SUMMARY_HEADER = "[Compressed conversation section]";
 
@@ -151,6 +155,7 @@ export function prune(
   // moves old summaries through an otherwise append-only cached prefix.
   const seqIntervals = coveredSeqIntervals(state);
   const userAnchors = new Map<string, number>();
+  const allUserAnchors = new Map<string, number>();
   let fallbackIndex = messages.length;
   const userSuccessors = new Map<number, string>();
   if (inject && !options.headSummaryAnchors) {
@@ -172,6 +177,7 @@ export function prune(
         for (let i = start; i < end; i++) {
           const message = messages[i]!;
           if (message.contentType === "tool-result") continue;
+          allUserAnchors.set(message.id, start);
           if (
             start !== firstUserIndex &&
             (isCovered(message.id, coveredBases) ||
@@ -228,8 +234,10 @@ export function prune(
         options.headSummaryAnchors ? 0 : fallbackIndex,
         visibleCompressCallIds,
         options.headSummaryAnchors ? new Map() : userAnchors,
+        allUserAnchors,
         userSuccessors,
         options.rememberFallbackAnchors === true && !options.headSummaryAnchors,
+        !options.headSummaryAnchors,
       )
     : [];
   // Summary ids of every block this session has ever created — active or
@@ -244,7 +252,7 @@ export function prune(
     inject ? state.blocks.map((block) => summaryMessageId(block.blockId)) : [],
   );
 
-  return stripOrphanedReasoning(
+  const result = stripOrphanedReasoning(
     stripOrphanedToolResults(
       stripOrphanedToolCalls(
         rebuildMessages(
@@ -256,11 +264,31 @@ export function prune(
           anchors,
           knownSummaryIds,
           options.headSummaryAnchors === true,
+          state.blocks,
         ),
         isCompressTool,
       ),
     ),
   );
+  if (
+    inject &&
+    options.rememberFallbackAnchors &&
+    !options.headSummaryAnchors &&
+    firstUserIndex >= 0
+  ) {
+    const blocks = new Map(
+      state.blocks.map((block) => [summaryMessageId(block.blockId), block]),
+    );
+    let predecessor: string | null = null;
+    for (const message of result) {
+      if (!isRenderedSummaryMessage(message)) continue;
+      const block = blocks.get(message.id);
+      if (!block) continue;
+      block.renderedSummaryPredecessorId = predecessor;
+      predecessor = block.blockId;
+    }
+  }
+  return result;
 }
 
 interface SummaryAnchor {
@@ -277,6 +305,86 @@ interface SummaryAnchor {
    *  consecutive turns), and the rendered summary is role "system", so
    *  leading the view is provider-safe. */
   unresolved?: boolean;
+  fallbackBlockId?: string;
+  fallbackRawIndex?: number;
+}
+
+/** Resolve only unambiguous direct coverage, following consumed blocks to a
+ * visible active descendant. This is a render relation, not a coverage claim. */
+function summaryReplacements(
+  blocks: CompressionBlock[],
+  visibleCompressCallIds: Set<string>,
+): (block: CompressionBlock) => string | undefined {
+  const byId = new Map(blocks.map((block) => [block.blockId, block]));
+  const parents = new Map<string, string[]>();
+  const byMessage = new Map<string, string[]>();
+  const wanted = new Set(
+    blocks.flatMap((block) =>
+      block.active && block.fallbackUserMessageId !== undefined
+        ? [baseIdOf(block.fallbackUserMessageId)]
+        : [],
+    ),
+  );
+  for (const block of blocks) {
+    for (const child of block.directBlockIds) {
+      const list = parents.get(child) ?? [];
+      list.push(block.blockId);
+      parents.set(child, list);
+    }
+    for (const id of block.directMessageIds ?? []) {
+      const base = baseIdOf(id);
+      if (!wanted.has(base)) continue;
+      const list = byMessage.get(base) ?? [];
+      list.push(block.blockId);
+      byMessage.set(base, list);
+    }
+  }
+  const cache = new Map<string, Set<string>>();
+  const visibleOwners = (id: string): Set<string> => {
+    const cached = cache.get(id);
+    if (cached) return cached;
+    const found = new Set<string>();
+    const seen = new Set<string>();
+    const queue = [id];
+    for (let i = 0; i < queue.length; i++) {
+      const next = queue[i]!;
+      if (seen.has(next)) continue;
+      seen.add(next);
+      const block = byId.get(next);
+      if (!block) continue;
+      if (
+        block.active &&
+        !block.retired &&
+        !(
+          block.compressCallId &&
+          visibleCompressCallIds.has(block.compressCallId)
+        )
+      ) {
+        found.add(next);
+      }
+      for (const parent of parents.get(next) ?? []) queue.push(parent);
+    }
+    cache.set(id, found);
+    return found;
+  };
+  return (block) => {
+    if (block.fallbackUserMessageId === undefined) return undefined;
+    const owners = new Set<string>();
+    for (const producer of byMessage.get(
+      baseIdOf(block.fallbackUserMessageId),
+    ) ?? []) {
+      if (producer === block.blockId) continue;
+      for (const owner of visibleOwners(producer)) {
+        if (owner !== block.blockId) owners.add(owner);
+      }
+    }
+    if (owners.size > 1) return undefined;
+    if (owners.size === 1) return owners.values().next().value;
+    if (block.fallbackSummaryBlockId === undefined) return undefined;
+    const previous = visibleOwners(block.fallbackSummaryBlockId);
+    if (previous.size !== 1 || previous.has(block.blockId)) return undefined;
+    return previous.values().next().value;
+  };
 }
 
 function collectSummaryAnchors(
@@ -289,10 +397,13 @@ function collectSummaryAnchors(
   // collection site above for the rationale and the safety conditions).
   visibleCompressCallIds: Set<string>,
   userAnchors: Map<string, number>,
+  allUserAnchors: Map<string, number>,
   userSuccessors: Map<number, string>,
   rememberFallback: boolean,
+  allowReplacements: boolean,
 ): SummaryAnchor[] {
   const anchors: SummaryAnchor[] = [];
+  let replacement: ReturnType<typeof summaryReplacements> | undefined;
   for (const block of activeBlocks(state)) {
     // #5765 retire: the user marked this block out of the resident view — its
     // summary is intentionally NOT re-rendered here. Its folded messages stay
@@ -305,7 +416,10 @@ function collectSummaryAnchors(
     // summary text, so injecting the block render would duplicate it. The
     // stale render (if a previously-pruned view carried one) is dropped by
     // rebuildMessages via knownSummaryIds and NOT re-injected here.
-    if (block.compressCallId && visibleCompressCallIds.has(block.compressCallId))
+    if (
+      block.compressCallId &&
+      visibleCompressCallIds.has(block.compressCallId)
+    )
       continue;
     // Prefer the position of an already-rendered summary (hosts may pass a
     // previously-pruned view): keeps the summary stable in place instead of
@@ -346,11 +460,15 @@ function collectSummaryAnchors(
         ? undefined
         : userAnchors.get(block.fallbackUserMessageId);
     const unresolvedIndex = remembered ?? fallbackIndex;
-    if (earliest === null && rememberFallback) {
-      const successor = userSuccessors.get(unresolvedIndex);
-      // A transient tool-only/no-user view is not evidence that the saved
-      // successor was rewritten. Keep it for the next full client resend.
-      if (successor !== undefined) block.fallbackUserMessageId = successor;
+    let fallbackBlockId: string | undefined;
+    if (
+      allowReplacements &&
+      earliest === null &&
+      remembered === undefined &&
+      block.fallbackUserMessageId !== undefined
+    ) {
+      replacement ??= summaryReplacements(state.blocks, visibleCompressCallIds);
+      fallbackBlockId = replacement(block);
     }
     anchors.push({
       blockId: block.blockId,
@@ -362,7 +480,56 @@ function collectSummaryAnchors(
       // the user's current question, which the model then answered instead.
       insertAt: earliest ?? unresolvedIndex,
       unresolved: earliest === null,
+      fallbackBlockId,
+      fallbackRawIndex:
+        fallbackBlockId && block.fallbackUserMessageId
+          ? allUserAnchors.get(block.fallbackUserMessageId)
+          : undefined,
     });
+  }
+  const byId = new Map(anchors.map((anchor) => [anchor.blockId, anchor]));
+  const blocksById = new Map(
+    state.blocks.map((block) => [block.blockId, block]),
+  );
+  const valid = new Map<string, boolean>();
+  for (const anchor of anchors) {
+    const path: string[] = [];
+    const seen = new Set<string>();
+    let current: SummaryAnchor | undefined = anchor;
+    let ok = true;
+    while (current) {
+      const cached = valid.get(current.blockId);
+      if (cached !== undefined) {
+        ok = cached;
+        break;
+      }
+      if (seen.has(current.blockId)) {
+        ok = false;
+        break;
+      }
+      seen.add(current.blockId);
+      path.push(current.blockId);
+      if (current.fallbackBlockId === undefined) break;
+      current = byId.get(current.fallbackBlockId);
+      if (!current) ok = false;
+    }
+    for (const id of path) valid.set(id, ok);
+  }
+  for (const anchor of anchors) {
+    if (!anchor.unresolved) continue;
+    if (!valid.get(anchor.blockId)) anchor.fallbackBlockId = undefined;
+    if (!rememberFallback) continue;
+    const block = blocksById.get(anchor.blockId)!;
+    if (anchor.fallbackBlockId !== undefined) {
+      block.fallbackSummaryBlockId = anchor.fallbackBlockId;
+    } else {
+      const successor = userSuccessors.get(anchor.insertAt);
+      // A transient tool-only/no-user view is not evidence of a rewrite.
+      if (successor !== undefined) {
+        block.fallbackUserMessageId = successor;
+        delete block.fallbackSummaryBlockId;
+      }
+    }
   }
   anchors.sort((left, right) => left.insertAt - right.insertAt);
   return anchors;
@@ -482,6 +649,179 @@ type WireIndexedCore = { wireIndex?: number };
 const wireIndexOf = (m: CoreMessage): number | undefined =>
   (m as WireIndexedCore).wireIndex;
 
+function orderSummaryAnchors(
+  anchors: SummaryAnchor[],
+  blocks: CompressionBlock[],
+): SummaryAnchor[] {
+  if (!anchors.some((anchor) => anchor.fallbackBlockId !== undefined)) {
+    return anchors.sort((left, right) => left.insertAt - right.insertAt);
+  }
+  const byId = new Map(anchors.map((anchor) => [anchor.blockId, anchor]));
+  const blocksById = new Map(blocks.map((block) => [block.blockId, block]));
+  const fallbackLimits = new Map(
+    anchors
+      .filter((anchor) => anchor.fallbackBlockId)
+      .map((anchor) => [
+        anchor.blockId,
+        Math.min(anchor.insertAt, anchor.fallbackRawIndex ?? Infinity),
+      ]),
+  );
+  const predecessor = new Map<string, string>();
+  for (const anchor of anchors) {
+    let previous = blocksById.get(anchor.blockId)?.renderedSummaryPredecessorId;
+    const seen = new Set([anchor.blockId]);
+    while (previous && !byId.has(previous) && !seen.has(previous)) {
+      seen.add(previous);
+      previous = blocksById.get(previous)?.renderedSummaryPredecessorId;
+    }
+    if (previous && byId.has(previous) && !seen.has(previous)) {
+      predecessor.set(anchor.blockId, previous);
+    }
+  }
+  const children = new Map<string, string[]>();
+  for (const [id, previous] of predecessor) {
+    const list = children.get(previous) ?? [];
+    list.push(id);
+    children.set(previous, list);
+  }
+  // A partial view can leave multiple successors for an old predecessor.
+  // Such a fork does not prove their relative order.
+  for (const ids of children.values()) {
+    if (ids.length > 1) for (const id of ids) predecessor.delete(id);
+  }
+  const successor = new Map<string, string>();
+  for (const [id, previous] of predecessor) successor.set(previous, id);
+  const chains: SummaryAnchor[][] = [];
+  for (const anchor of anchors) {
+    if (predecessor.has(anchor.blockId)) continue;
+    const chain: SummaryAnchor[] = [];
+    const seen = new Set<string>();
+    let id: string | undefined = anchor.blockId;
+    while (id !== undefined && !seen.has(id)) {
+      seen.add(id);
+      chain.push(byId.get(id)!);
+      id = successor.get(id);
+    }
+    if (id === undefined) chains.push(chain);
+  }
+
+  // A remembered user may be replaced by a whole fold. Fit the displaced
+  // summary between its previously visible neighbours when they still agree;
+  // resolved anchors themselves remain authoritative.
+  for (let round = 0; round <= anchors.length; round++) {
+    const before = anchors.map((anchor) => anchor.insertAt);
+    const resolved = new Set<string>();
+    for (const anchor of anchors) {
+      const path: SummaryAnchor[] = [];
+      let current: SummaryAnchor | undefined = anchor;
+      while (current?.fallbackBlockId && !resolved.has(current.blockId)) {
+        path.push(current);
+        current = byId.get(current.fallbackBlockId);
+      }
+      for (let i = path.length - 1; i >= 0; i--) {
+        const item = path[i]!;
+        const target = byId.get(item.fallbackBlockId!);
+        if (target) {
+          item.insertAt = Math.min(
+            target.insertAt,
+            fallbackLimits.get(item.blockId)!,
+          );
+        }
+        resolved.add(item.blockId);
+      }
+    }
+    for (const chain of chains) {
+      for (let start = 0; start < chain.length;) {
+        if (!chain[start]!.fallbackBlockId) {
+          start++;
+          continue;
+        }
+        let end = start + 1;
+        while (end < chain.length && chain[end]!.fallbackBlockId) end++;
+        const lower = start > 0 ? chain[start - 1]!.insertAt : -Infinity;
+        let upper = end < chain.length ? chain[end]!.insertAt : Infinity;
+        for (let i = start; i < end; i++) {
+          upper = Math.min(upper, fallbackLimits.get(chain[i]!.blockId)!);
+        }
+        if (lower <= upper) {
+          for (let i = start; i < end; i++) {
+            chain[i]!.insertAt = Math.max(
+              lower,
+              Math.min(upper, chain[i]!.insertAt),
+            );
+          }
+          for (let i = end - 2; i >= start; i--) {
+            chain[i]!.insertAt = Math.min(
+              chain[i]!.insertAt,
+              chain[i + 1]!.insertAt,
+            );
+          }
+        }
+        start = end;
+      }
+    }
+    if (anchors.every((anchor, i) => anchor.insertAt === before[i])) break;
+  }
+
+  anchors.sort((left, right) => left.insertAt - right.insertAt);
+  const output: SummaryAnchor[] = [];
+  for (let start = 0; start < anchors.length;) {
+    let end = start + 1;
+    while (
+      end < anchors.length &&
+      anchors[end]!.insertAt === anchors[start]!.insertAt
+    )
+      end++;
+    const group = anchors.slice(start, end);
+    const groupIds = new Set(group.map((anchor) => anchor.blockId));
+    const oldEdges: Array<[string, string]> = [];
+    const replacementEdges: Array<[string, string]> = [];
+    for (const anchor of group) {
+      const previous = predecessor.get(anchor.blockId);
+      if (
+        previous &&
+        groupIds.has(previous) &&
+        (anchor.fallbackBlockId || byId.get(previous)?.fallbackBlockId)
+      ) {
+        oldEdges.push([previous, anchor.blockId]);
+      }
+      if (anchor.fallbackBlockId && groupIds.has(anchor.fallbackBlockId)) {
+        replacementEdges.push([anchor.blockId, anchor.fallbackBlockId]);
+      }
+    }
+    const sortGroup = (
+      edges: Array<[string, string]>,
+    ): SummaryAnchor[] | undefined => {
+      const indegree = new Map(group.map((anchor) => [anchor.blockId, 0]));
+      const outgoing = new Map<string, Set<string>>();
+      for (const [from, to] of edges) {
+        const list = outgoing.get(from) ?? new Set<string>();
+        if (!list.has(to)) indegree.set(to, indegree.get(to)! + 1);
+        list.add(to);
+        outgoing.set(from, list);
+      }
+      const queue = group.filter(
+        (anchor) => indegree.get(anchor.blockId) === 0,
+      );
+      for (let i = 0; i < queue.length; i++) {
+        for (const next of outgoing.get(queue[i]!.blockId) ?? []) {
+          const count = indegree.get(next)! - 1;
+          indegree.set(next, count);
+          if (count === 0) queue.push(byId.get(next)!);
+        }
+      }
+      return queue.length === group.length ? queue : undefined;
+    };
+    output.push(
+      ...(sortGroup([...oldEdges, ...replacementEdges]) ??
+        sortGroup(oldEdges) ??
+        group),
+    );
+    start = end;
+  }
+  return output;
+}
+
 function rebuildMessages(
   messages: CoreMessage[],
   coveredBases: Set<string>,
@@ -492,6 +832,7 @@ function rebuildMessages(
   anchors: SummaryAnchor[],
   knownSummaryIds: Set<string>,
   headAnchors: boolean,
+  blocks: CompressionBlock[],
 ): CoreMessage[] {
   // #3642: canonical granularity splits one wire message into one core per
   // content part, so the opening user message can be a RUN of user cores
@@ -516,12 +857,19 @@ function rebuildMessages(
     }
   }
   const ix = anchors.length > 0 ? buildAnchorPairingIndex(messages) : null;
-  const safeAnchors = anchors
+  const safeAnchors = orderSummaryAnchors(
+    anchors
     .map((anchor) => ({
       ...anchor,
       insertAt: ix
         ? pairSafeAnchorIndex(messages, anchor.insertAt, ix)
         : anchor.insertAt,
+        fallbackRawIndex:
+          anchor.fallbackRawIndex === undefined
+            ? undefined
+            : ix
+              ? pairSafeAnchorIndex(messages, anchor.fallbackRawIndex, ix)
+              : anchor.fallbackRawIndex,
     }))
     // #2733: a summary may NEVER precede the session's first user message.
     // The pin is the provider prefix-cache head; a block whose range roots
@@ -544,8 +892,18 @@ function rebuildMessages(
             anchor.insertAt,
             anchor.unresolved === true ? firstUserIndex : firstUserPinEnd,
           ),
-    }))
-    .sort((left, right) => left.insertAt - right.insertAt);
+        fallbackRawIndex:
+          anchor.fallbackRawIndex === undefined
+            ? undefined
+            : headAnchors
+              ? anchor.fallbackRawIndex
+              : Math.max(
+                  anchor.fallbackRawIndex,
+                  anchor.unresolved === true ? firstUserIndex : firstUserPinEnd,
+                ),
+      })),
+    blocks,
+  );
   const result: CoreMessage[] = [];
   const pending = [...safeAnchors];
 
@@ -664,7 +1022,8 @@ function stripOrphanedToolCalls(
     if (m.contentType === "tool-result") {
       if (m.toolCallId) answeredCallIds.add(m.toolCallId);
     } else if (m.contentType === "tool-call" && m.toolCallId) {
-      if (typeof m.toolName === "string" && isCompressTool(m.toolName)) continue;
+      if (typeof m.toolName === "string" && isCompressTool(m.toolName))
+        continue;
       if (!answeredCallIds.has(m.toolCallId)) drop.add(i);
     }
   }
