@@ -42,10 +42,14 @@ test("fallback successor learned without a new fold survives host persist/reload
         const first = core.processTurn({ messages, state: s.state, config, tokenCount: 100, renderTags: "none" });
         s.state = first.state;
         assert.equal(s.state.blocks[0]!.fallbackUserMessageId, "task");
+        assert.equal(s.state.blocks[0]!.renderedSummaryPredecessorId, null);
+        s.state.blocks[0]!.fallbackSummaryBlockId = "b-successor";
         await store.writeNow(s);
         const restored = reader.loadSync(s.id, { protocol: "openai", upstreamOrigin: "http://upstream" });
         assert.ok(restored);
         assert.equal(restored.state.blocks[0]!.fallbackUserMessageId, "task");
+        assert.equal(restored.state.blocks[0]!.fallbackSummaryBlockId, "b-successor");
+        assert.equal(restored.state.blocks[0]!.renderedSummaryPredecessorId, null);
         const second = core.processTurn({ messages: [...messages, { id: "new-task", role: "user", contentType: "text", text: "New task" }], state: restored.state, config, tokenCount: 100, renderTags: "none" });
         assert.deepEqual(second.messages.slice(0, first.messages.length), first.messages);
     } finally {
@@ -65,11 +69,15 @@ test("unified store persists a fallback-only block payload update", async () => 
         db.ingestSession(plan());
         // No fold, coverage, summary, token-count or timestamp changes.
         s.state.blocks[0]!.fallbackUserMessageId = "stable-user";
+        s.state.blocks[0]!.fallbackSummaryBlockId = "b-successor";
+        s.state.blocks[0]!.renderedSummaryPredecessorId = "b-previous";
         db.ingestSession(plan());
         const session = db.getSessionRow(s.id);
         assert.ok(session);
         const restored = loadLegacyView({ session, messages: db.getMessages(s.id), blocks: db.getBlocks(s.id), deadRefs: db.getDeadRefs(s.id), refs: db.getRefs(s.id) });
         assert.equal((restored.state.blocks as typeof s.state.blocks)[0]!.fallbackUserMessageId, "stable-user");
+        assert.equal((restored.state.blocks as typeof s.state.blocks)[0]!.fallbackSummaryBlockId, "b-successor");
+        assert.equal((restored.state.blocks as typeof s.state.blocks)[0]!.renderedSummaryPredecessorId, "b-previous");
     } finally {
         db.close(); rmrf(dir);
     }

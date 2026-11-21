@@ -74,6 +74,10 @@ export interface CompressionBlock {
   /** Render-only fallback: stable surviving user successor when coverage is
    * absent from the current view. Never a coverage claim or array position. */
   fallbackUserMessageId?: string;
+  /** Render-only successor after the remembered user was folded. */
+  fallbackSummaryBlockId?: string;
+  /** Previous summary in the last remembered rendered view; null means first. */
+  renderedSummaryPredecessorId?: string | null;
   directMessageIds: string[];
   effectiveMessageIds: string[];
   directBlockIds: string[];
